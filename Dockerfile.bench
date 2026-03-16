@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements/base.txt requirements/base.txt
+COPY requirements/bench.txt requirements/bench.txt
+RUN pip install --no-cache-dir -r requirements/bench.txt
+
+COPY orbit/ orbit/
+COPY pyproject.toml .
+COPY configs/ configs/
+COPY scripts/ scripts/
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "-m", "orbit.bench.runner"]

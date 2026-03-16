@@ -1,0 +1,6 @@
+workload: agentic
+num_requests: 200
+arrival_rate: 10.0
+system_prompt_reuse_ratio: 0.9
+num_unique_system_prompts: 2
+max_tokens: 128

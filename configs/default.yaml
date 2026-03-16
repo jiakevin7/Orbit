@@ -1,0 +1,20 @@
+router:
+  host: "0.0.0.0"
+  port: 8000
+  alpha: 1.0
+  beta: 0.5
+  semantic_top_k: 3
+  semantic_threshold: 0.5
+  strong_hit_threshold: 0.9
+  block_size: 16
+  tokenizer: "cl100k_base"
+
+replica:
+  cache_capacity_blocks: 1000
+  block_size: 16
+  prefill_ms_per_token: 0.5
+  decode_ms_per_token: 10.0
+  max_concurrent: 4
+
+monitor:
+  poll_interval_s: 1.0

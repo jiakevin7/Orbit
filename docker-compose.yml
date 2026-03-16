@@ -1,0 +1,131 @@
+version: "3.8"
+
+networks:
+  orbit-net:
+    driver: bridge
+
+services:
+  orbit-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    ports:
+      - "8000:8000"
+    environment:
+      ORBIT_PORT: "8000"
+      ORBIT_REPLICA_URLS: "http://orbit-replica-1:8001,http://orbit-replica-2:8001,http://orbit-replica-3:8001,http://orbit-replica-4:8001"
+      ORBIT_MONITOR_URL: "http://orbit-monitor:8080"
+      ORBIT_ALPHA: "1.0"
+      ORBIT_BETA: "0.5"
+      ORBIT_BLOCK_SIZE: "16"
+      ORBIT_TOKENIZER: "cl100k_base"
+    networks:
+      - orbit-net
+    depends_on:
+      - orbit-replica-1
+      - orbit-replica-2
+      - orbit-replica-3
+      - orbit-replica-4
+
+  orbit-replica-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.replica
+    environment:
+      ORBIT_PORT: "8001"
+      ORBIT_REPLICA_ID: "replica-1"
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_CACHE_CAPACITY: "1000"
+      ORBIT_BLOCK_SIZE: "16"
+      ORBIT_PREFILL_MS: "0.5"
+      ORBIT_DECODE_MS: "10.0"
+      ORBIT_MAX_CONCURRENT: "4"
+      ORBIT_TOKENIZER: "cl100k_base"
+    networks:
+      - orbit-net
+
+  orbit-replica-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.replica
+    environment:
+      ORBIT_PORT: "8001"
+      ORBIT_REPLICA_ID: "replica-2"
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_CACHE_CAPACITY: "1000"
+      ORBIT_BLOCK_SIZE: "16"
+      ORBIT_PREFILL_MS: "0.5"
+      ORBIT_DECODE_MS: "10.0"
+      ORBIT_MAX_CONCURRENT: "4"
+      ORBIT_TOKENIZER: "cl100k_base"
+    networks:
+      - orbit-net
+
+  orbit-replica-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.replica
+    environment:
+      ORBIT_PORT: "8001"
+      ORBIT_REPLICA_ID: "replica-3"
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_CACHE_CAPACITY: "1000"
+      ORBIT_BLOCK_SIZE: "16"
+      ORBIT_PREFILL_MS: "0.5"
+      ORBIT_DECODE_MS: "10.0"
+      ORBIT_MAX_CONCURRENT: "4"
+      ORBIT_TOKENIZER: "cl100k_base"
+    networks:
+      - orbit-net
+
+  orbit-replica-4:
+    build:
+      context: .
+      dockerfile: Dockerfile.replica
+    environment:
+      ORBIT_PORT: "8001"
+      ORBIT_REPLICA_ID: "replica-4"
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_CACHE_CAPACITY: "1000"
+      ORBIT_BLOCK_SIZE: "16"
+      ORBIT_PREFILL_MS: "0.5"
+      ORBIT_DECODE_MS: "10.0"
+      ORBIT_MAX_CONCURRENT: "4"
+      ORBIT_TOKENIZER: "cl100k_base"
+    networks:
+      - orbit-net
+
+  orbit-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.monitor
+    ports:
+      - "8080:8080"
+    environment:
+      ORBIT_PORT: "8080"
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_REPLICA_URLS: "http://orbit-replica-1:8001,http://orbit-replica-2:8001,http://orbit-replica-3:8001,http://orbit-replica-4:8001"
+      ORBIT_POLL_INTERVAL: "1.0"
+    networks:
+      - orbit-net
+    depends_on:
+      - orbit-router
+
+  orbit-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench
+    environment:
+      ORBIT_ROUTER_URL: "http://orbit-router:8000"
+      ORBIT_REPLICA_URLS: "http://orbit-replica-1:8001,http://orbit-replica-2:8001,http://orbit-replica-3:8001,http://orbit-replica-4:8001"
+      ORBIT_WORKLOAD: "chat"
+      ORBIT_NUM_REQUESTS: "100"
+      ORBIT_ARRIVAL_RATE: "10.0"
+    volumes:
+      - ./results:/app/results
+    networks:
+      - orbit-net
+    depends_on:
+      - orbit-router
+    profiles:
+      - bench

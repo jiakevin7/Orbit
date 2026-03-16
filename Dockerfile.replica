@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements/base.txt requirements/base.txt
+COPY requirements/replica.txt requirements/replica.txt
+RUN pip install --no-cache-dir -r requirements/replica.txt
+
+COPY orbit/ orbit/
+COPY pyproject.toml .
+
+ENV PYTHONPATH=/app
+
+CMD ["uvicorn", "orbit.replica.app:app", "--host", "0.0.0.0", "--port", "8001", "--log-level", "info"]
