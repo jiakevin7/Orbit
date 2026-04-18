@@ -1,0 +1,57 @@
+name: Live llama.cpp Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: "Optional absolute path to a local GGUF model on the self-hosted runner"
+        required: false
+        type: string
+
+jobs:
+  live-integration:
+    runs-on:
+      - self-hosted
+      - macOS
+      - ARM64
+      - orbit-live
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve live test model path
+        shell: bash
+        run: |
+          set -euo pipefail
+          model_path="${{ inputs.model_path }}"
+          if [[ -z "$model_path" ]]; then
+            model_path="${{ vars.ORBIT_LIVE_TEST_MODEL }}"
+          fi
+          if [[ -z "$model_path" ]]; then
+            echo "::error::Set workflow input model_path or repository variable ORBIT_LIVE_TEST_MODEL."
+            exit 1
+          fi
+          if [[ ! -f "$model_path" ]]; then
+            echo "::error::Model path does not exist: $model_path"
+            exit 1
+          fi
+          echo "ORBIT_LIVE_TEST_MODEL=$model_path" >> "$GITHUB_ENV"
+
+      - name: Verify llama-server is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v llama-server >/dev/null 2>&1; then
+            echo "::error::llama-server is not installed on this runner."
+            exit 1
+          fi
+
+      - name: Run unit suite and live integration test
+        env:
+          ORBIT_RUN_LIVE_TESTS: "1"
+        run: bash scripts/run_ci_checks.sh --with-live
