@@ -1,15 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, Sequence
 
 from .hashing import prefix_hashes
 from .models import ClusterSummary, Request, RouteDecision
 
 
+_COST_FIELDS = (
+    "fixed_overhead",
+    "prefill_cost_per_token",
+    "decode_cost_per_token",
+    "queue_depth_penalty",
+    "stale_penalty_per_second",
+    "uncertainty_penalty_per_token",
+    "missing_summary_penalty",
+)
+
+
 @dataclass(frozen=True)
 class RouterConfig:
-    summary_depths: tuple[int, ...] = (64, 128, 256, 512)
+    summary_depths: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512)
     fixed_overhead: float = 0.0
     prefill_cost_per_token: float = 1.0
     decode_cost_per_token: float = 2.0
@@ -17,8 +28,10 @@ class RouterConfig:
     stale_penalty_per_second: float = 0.25
     uncertainty_penalty_per_token: float = 0.25
     low_overlap_fraction: float = 0.1
+    min_summary_overlap_tokens: int = 8
     max_summary_age: float = 30.0
     missing_summary_penalty: float = 64.0
+    cluster_overrides: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -41,7 +54,10 @@ class Router:
         self.views: Dict[str, RouterView] = {}
 
     def network_cost(self, cluster_id: str) -> float:
-        return self.network_costs.get(cluster_id, 0.0)
+        return self.network_costs.get(cluster_id, float("inf"))
+
+    def reachable_cluster_ids(self) -> tuple[str, ...]:
+        return tuple(self.network_costs)
 
     def receive_summary(self, summary: ClusterSummary, received_at: float, source: str) -> None:
         current = self.views.get(summary.cluster_id)
@@ -58,6 +74,9 @@ class Router:
 
     def export_summaries(self) -> Dict[str, ClusterSummary]:
         return {cluster_id: view.summary for cluster_id, view in self.views.items()}
+
+    def summary_memory_bytes(self) -> int:
+        return sum(view.summary.byte_size for view in self.views.values())
 
     def estimate_reusable_prefix(
         self,
@@ -77,25 +96,104 @@ class Router:
                 break
         return deepest_match, matched_levels
 
+    def load_only_route(self, request: Request, cluster_ids: Iterable[str], now: float) -> RouteDecision:
+        cluster_ids = tuple(cluster_ids)
+        if not cluster_ids:
+            raise ValueError(f"router {self.router_id} has no reachable clusters")
+        best_cluster = None
+        best_cost = float("inf")
+        best_details: dict[str, float] = {}
+        for cluster_id in cluster_ids:
+            view = self.views.get(cluster_id)
+            raw_queue_depth = 0
+            metadata_age = 0.0
+            if view is not None:
+                raw_queue_depth = view.summary.queue_depth
+                metadata_age = max(0.0, now - view.summary.created_at)
+            predicted_latency, details = self.predict_latency(
+                cluster_id=cluster_id,
+                request=request,
+                estimated_reusable_tokens=0,
+                raw_queue_depth=raw_queue_depth,
+                metadata_age=metadata_age,
+                uncertainty_gap=0,
+                missing_summary=view is None,
+            )
+            if predicted_latency < best_cost:
+                best_cost = predicted_latency
+                best_cluster = cluster_id
+                best_details = details
+        return RouteDecision(
+            policy="load_only",
+            cluster_id=best_cluster or next(iter(cluster_ids)),
+            estimated_reusable_tokens=0,
+            predicted_latency=best_cost,
+            details=best_details,
+        )
+
+    def predict_latency(
+        self,
+        cluster_id: str,
+        request: Request,
+        estimated_reusable_tokens: int,
+        raw_queue_depth: int,
+        metadata_age: float = 0.0,
+        uncertainty_gap: int = 0,
+        missing_summary: bool = False,
+        extra_uncertainty_penalty: float = 0.0,
+    ) -> tuple[float, dict[str, float]]:
+        coefficients = self._coefficients_for_cluster(cluster_id)
+        remaining_prefill = max(0, request.input_length - estimated_reusable_tokens)
+        queue_delay = raw_queue_depth * coefficients["queue_depth_penalty"]
+        stale_penalty = max(0.0, metadata_age) * coefficients["stale_penalty_per_second"]
+        uncertainty_penalty = (
+            uncertainty_gap * coefficients["uncertainty_penalty_per_token"]
+            + extra_uncertainty_penalty
+        )
+        missing_summary_penalty = coefficients["missing_summary_penalty"] if missing_summary else 0.0
+        predicted_latency = (
+            self.network_cost(cluster_id)
+            + coefficients["fixed_overhead"]
+            + queue_delay
+            + remaining_prefill * coefficients["prefill_cost_per_token"]
+            + request.continuation_tokens * coefficients["decode_cost_per_token"]
+            + stale_penalty
+            + uncertainty_penalty
+            + missing_summary_penalty
+        )
+        return predicted_latency, {
+            "network_cost": self.network_cost(cluster_id),
+            "queue_delay": queue_delay,
+            "raw_queue_depth": raw_queue_depth,
+            "estimated_remaining_prefill_tokens": remaining_prefill,
+            "stale_penalty": stale_penalty,
+            "metadata_age": max(0.0, metadata_age),
+            "uncertainty_gap": uncertainty_gap,
+            "uncertainty_penalty": uncertainty_penalty,
+            "missing_summary": 1.0 if missing_summary else 0.0,
+            "missing_summary_penalty": missing_summary_penalty,
+        }
+
     def route(self, request: Request, cluster_ids: Iterable[str], now: float) -> RouteDecision:
+        cluster_ids = tuple(cluster_ids)
+        if not cluster_ids:
+            raise ValueError(f"router {self.router_id} has no reachable clusters")
         request_length = request.input_length
         candidates: list[RouteDecision] = []
         has_fresh_summary = False
 
         for cluster_id in cluster_ids:
             summary_view = self.views.get(cluster_id)
-            network = self.network_cost(cluster_id)
             if summary_view is None:
-                estimated_remaining_prefill = request_length
                 uncertainty_gap = request_length
-                raw_queue_depth = 0
-                predicted_latency = (
-                    network
-                    + self.config.fixed_overhead
-                    + estimated_remaining_prefill * self.config.prefill_cost_per_token
-                    + request.continuation_tokens * self.config.decode_cost_per_token
-                    + uncertainty_gap * self.config.uncertainty_penalty_per_token
-                    + self.config.missing_summary_penalty
+                predicted_latency, details = self.predict_latency(
+                    cluster_id=cluster_id,
+                    request=request,
+                    estimated_reusable_tokens=0,
+                    raw_queue_depth=0,
+                    metadata_age=0.0,
+                    uncertainty_gap=uncertainty_gap,
+                    missing_summary=True,
                 )
                 candidates.append(
                     RouteDecision(
@@ -104,18 +202,7 @@ class Router:
                         estimated_reusable_tokens=0,
                         predicted_latency=predicted_latency,
                         used_fallback=True,
-                        details={
-                            "network_cost": network,
-                            "queue_delay": 0.0,
-                            "raw_queue_depth": raw_queue_depth,
-                            "estimated_remaining_prefill_tokens": estimated_remaining_prefill,
-                            "stale_penalty": 0.0,
-                            "metadata_age": 0.0,
-                            "uncertainty_gap": uncertainty_gap,
-                            "uncertainty_penalty": uncertainty_gap * self.config.uncertainty_penalty_per_token,
-                            "missing_summary": 1.0,
-                            "missing_summary_penalty": self.config.missing_summary_penalty,
-                        },
+                        details=details,
                     )
                 )
                 continue
@@ -130,21 +217,19 @@ class Router:
             )
             estimated_remaining_prefill = max(0, request_length - estimated_reuse)
             raw_queue_depth = summary.queue_depth
-            queue_delay = raw_queue_depth * self.config.queue_depth_penalty
-            stale_penalty = metadata_age * self.config.stale_penalty_per_second
             uncertainty_gap = self._uncertainty_gap(request_length, estimated_reuse, summary.depths)
-            uncertainty_penalty = uncertainty_gap * self.config.uncertainty_penalty_per_token
+            extra_uncertainty_penalty = 0.0
             if matched_levels == 0:
-                uncertainty_penalty += self.config.queue_depth_penalty * 0.5
-
-            predicted_latency = (
-                network
-                + self.config.fixed_overhead
-                + queue_delay
-                + self.config.prefill_cost_per_token * estimated_remaining_prefill
-                + request.continuation_tokens * self.config.decode_cost_per_token
-                + stale_penalty
-                + uncertainty_penalty
+                extra_uncertainty_penalty = self._coefficients_for_cluster(cluster_id)["queue_depth_penalty"] * 0.5
+            predicted_latency, details = self.predict_latency(
+                cluster_id=cluster_id,
+                request=request,
+                estimated_reusable_tokens=estimated_reuse,
+                raw_queue_depth=raw_queue_depth,
+                metadata_age=metadata_age,
+                uncertainty_gap=uncertainty_gap,
+                missing_summary=False,
+                extra_uncertainty_penalty=extra_uncertainty_penalty,
             )
             candidates.append(
                 RouteDecision(
@@ -152,24 +237,13 @@ class Router:
                     cluster_id=cluster_id,
                     estimated_reusable_tokens=estimated_reuse,
                     predicted_latency=predicted_latency,
-                        used_fallback=False,
-                        details={
-                            "network_cost": network,
-                            "queue_delay": queue_delay,
-                            "raw_queue_depth": raw_queue_depth,
-                            "estimated_remaining_prefill_tokens": estimated_remaining_prefill,
-                            "stale_penalty": stale_penalty,
-                            "metadata_age": metadata_age,
-                            "uncertainty_gap": uncertainty_gap,
-                            "uncertainty_penalty": uncertainty_penalty,
-                            "missing_summary": 0.0,
-                            "missing_summary_penalty": 0.0,
-                        },
-                    )
+                    used_fallback=False,
+                    details=details,
                 )
+            )
 
         best_overlap = max(candidate.estimated_reusable_tokens for candidate in candidates)
-        if not has_fresh_summary or best_overlap < request_length * self.config.low_overlap_fraction:
+        if not has_fresh_summary or best_overlap < self._summary_overlap_threshold(request_length):
             return self._load_fallback(candidates, request.continuation_tokens)
 
         return min(candidates, key=lambda candidate: candidate.predicted_latency)
@@ -211,3 +285,19 @@ class Router:
                 next_depth = depth
                 break
         return max(0, next_depth - estimated_reuse)
+
+    def _summary_overlap_threshold(self, request_length: int) -> float:
+        fractional_threshold = request_length * self.config.low_overlap_fraction
+        if fractional_threshold <= 0:
+            return 0.0
+        return min(
+            fractional_threshold,
+            float(max(0, self.config.min_summary_overlap_tokens)),
+        )
+
+    def _coefficients_for_cluster(self, cluster_id: str) -> dict[str, float]:
+        overrides = self.config.cluster_overrides.get(cluster_id, {})
+        return {
+            field_name: float(overrides.get(field_name, getattr(self.config, field_name)))
+            for field_name in _COST_FIELDS
+        }

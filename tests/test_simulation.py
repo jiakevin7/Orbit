@@ -49,6 +49,44 @@ class SimulationTests(unittest.TestCase):
         self.assertGreaterEqual(metrics.control_plane_bytes, 0)
         self.assertGreaterEqual(metrics.summary_memory_bytes, 0)
 
+    def test_simulation_runs_with_multiprocess_control_plane(self) -> None:
+        config = SimulationConfig(
+            control_plane_mode="multiprocess",
+            router_ids=("router-a", "router-b"),
+            cluster_ids=("cluster-a", "cluster-b"),
+            cluster_config=ClusterConfig(
+                cache_capacity=16,
+                summary_depths=(32, 64),
+                summary_interval=2.0,
+                decode_cost_per_token=3.0,
+            ),
+            router_config=RouterConfig(
+                summary_depths=(32, 64),
+                low_overlap_fraction=0.0,
+                queue_depth_penalty=1.0,
+            ),
+            workload=WorkloadConfig(
+                num_requests=12,
+                router_ids=("router-a", "router-b"),
+                prefix_length_choices=(64,),
+                overlap_length_choices=(0, 32, 64),
+                continuation_token_range=(4, 8),
+                mean_interarrival=10.0,
+                seed=5,
+            ),
+            gossip_interval=2.0,
+        )
+
+        simulation = Simulation(config)
+        try:
+            records, metrics = simulation.run("summary")
+        finally:
+            simulation.close()
+
+        self.assertEqual(len(records), 12)
+        self.assertEqual(metrics.request_count, 12)
+        self.assertGreaterEqual(metrics.control_plane_bytes, 0)
+
     def test_oracle_is_not_worse_than_random_on_reuse(self) -> None:
         config = SimulationConfig(
             router_ids=("router-a", "router-b"),
@@ -97,6 +135,94 @@ class SimulationTests(unittest.TestCase):
             self.assertEqual(simulation.network_costs["router-b"]["cluster-b"], 0.005)
         finally:
             simulation.close()
+
+    def test_sparse_topology_filters_unreachable_clusters(self) -> None:
+        config = SimulationConfig(
+            router_ids=("router-a", "router-b"),
+            cluster_ids=("cluster-a", "cluster-b", "cluster-c"),
+            network_costs={
+                "router-a": {"cluster-a": 1.0, "cluster-b": 2.0},
+                "router-b": {"cluster-b": 1.0, "cluster-c": 2.0},
+            },
+            cluster_config=ClusterConfig(
+                cache_capacity=32,
+                summary_depths=(32, 64),
+                summary_interval=1.0,
+            ),
+            workload=WorkloadConfig(num_requests=0),
+        )
+        requests = [
+            Request(
+                request_id=f"req-{index}",
+                arrival_time=float(index),
+                router_id="router-a",
+                prefix_tokens=(index, index + 1, index + 2),
+                continuation_tokens=1,
+            )
+            for index in range(8)
+        ]
+
+        simulation = Simulation(config)
+        try:
+            records, _ = simulation.run("random", requests=requests)
+        finally:
+            simulation.close()
+
+        self.assertTrue(records)
+        self.assertTrue(all(record.cluster_id in {"cluster-a", "cluster-b"} for record in records))
+
+    def test_sparse_topology_failover_stays_within_reachable_clusters(self) -> None:
+        config = SimulationConfig(
+            router_ids=("router-a", "router-b"),
+            cluster_ids=("cluster-a", "cluster-b", "cluster-c"),
+            network_costs={
+                "router-a": {"cluster-a": 0.0, "cluster-b": 1.0},
+                "router-b": {"cluster-b": 0.0, "cluster-c": 1.0},
+            },
+            cluster_config=ClusterConfig(
+                cache_capacity=32,
+                summary_depths=(64, 128),
+                summary_interval=1.0,
+            ),
+            router_config=RouterConfig(
+                summary_depths=(64, 128),
+                low_overlap_fraction=0.0,
+                queue_depth_penalty=0.0,
+            ),
+            workload=WorkloadConfig(num_requests=0),
+            faults=FaultInjectionConfig(
+                failed_cluster_ids=("cluster-a",),
+                failure_start=1.5,
+                failure_duration=10.0,
+                retry_penalty=1.0,
+            ),
+        )
+        requests = [
+            Request(
+                request_id="req-0",
+                arrival_time=0.0,
+                router_id="router-a",
+                prefix_tokens=tuple(range(128)),
+                continuation_tokens=1,
+            ),
+            Request(
+                request_id="req-1",
+                arrival_time=2.0,
+                router_id="router-a",
+                prefix_tokens=tuple(range(128)),
+                continuation_tokens=1,
+            ),
+        ]
+
+        simulation = Simulation(config)
+        try:
+            records, _ = simulation.run("summary", requests=requests)
+        finally:
+            simulation.close()
+
+        self.assertEqual(records[1].initial_cluster_id, "cluster-a")
+        self.assertEqual(records[1].cluster_id, "cluster-b")
+        self.assertNotEqual(records[1].cluster_id, "cluster-c")
 
     def test_simulation_can_warm_up_before_measured_run(self) -> None:
         config = SimulationConfig(
@@ -315,6 +441,46 @@ class SimulationTests(unittest.TestCase):
         self.assertGreater(records[1].queue_delay, 0.0)
         self.assertEqual(records[1].actual_reusable_tokens, 3)
         self.assertLess(records[0].finished_at, records[1].finished_at)
+
+    def test_llama_cpp_multiprocess_prepare_requests_uses_proxy(self) -> None:
+        simulation = Simulation(
+            SimulationConfig(
+                backend="llama_cpp",
+                control_plane_mode="multiprocess",
+                router_ids=("router-a",),
+                cluster_ids=("cluster-a",),
+                llama_cpp=LlamaCppClusterConfig(
+                    model_path="/tmp/placeholder.gguf",
+                    manage_server=False,
+                ),
+                live_arrival_scale=0.01,
+            )
+        )
+        requests = [
+            Request(
+                request_id="req-0",
+                arrival_time=10.0,
+                router_id="router-a",
+                prefix_tokens=(1, 2, 3),
+                prompt_prefix_text="System:\nRespond briefly.\n\nUser:\nHello there.",
+            )
+        ]
+        cluster = simulation.clusters["cluster-a"]
+        try:
+            prepared_request = Request(
+                request_id="req-0",
+                arrival_time=10.0,
+                router_id="router-a",
+                prefix_tokens=(10, 20, 30),
+                prompt_prefix_text="System:\nRespond briefly.\n\nUser:\nHello there.",
+                prefix_token_source="llama_cpp",
+            )
+            with mock.patch.object(cluster, "prepare_requests", return_value=[prepared_request]) as prepare_mock:
+                prepared = simulation.prepare_requests(requests)
+            self.assertEqual(prepared[0].prefix_token_source, "llama_cpp")
+            prepare_mock.assert_called_once()
+        finally:
+            simulation.close()
 
     def test_gossip_delay_keeps_remote_router_view_stale(self) -> None:
         requests = [

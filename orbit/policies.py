@@ -11,6 +11,24 @@ from .router import Router
 PolicyFn = Callable[[Router, Request, Mapping[str, Cluster], float, random.Random], RouteDecision]
 
 
+def _load_fallback_route(
+    router: Router,
+    request: Request,
+    clusters: Mapping[str, Cluster],
+    now: float,
+    policy_name: str,
+) -> RouteDecision:
+    base = router.load_only_route(request, clusters.keys(), now)
+    return RouteDecision(
+        policy=policy_name,
+        cluster_id=base.cluster_id,
+        estimated_reusable_tokens=0,
+        predicted_latency=base.predicted_latency,
+        used_fallback=True,
+        details=base.details,
+    )
+
+
 def summary_policy(
     router: Router,
     request: Request,
@@ -64,48 +82,7 @@ def load_only_policy(
     rng: random.Random,
 ) -> RouteDecision:
     del rng
-    best_cluster = None
-    best_cost = float("inf")
-    best_details: dict[str, float] = {}
-    for cluster_id in clusters:
-        view = router.views.get(cluster_id)
-        queue_delay = 0.0
-        stale_penalty = 0.0
-        raw_queue_depth = 0
-        if view is not None:
-            raw_queue_depth = view.summary.queue_depth
-            queue_delay = raw_queue_depth * router.config.queue_depth_penalty
-            stale_penalty = max(0.0, now - view.summary.created_at) * router.config.stale_penalty_per_second
-        cost = (
-            router.network_cost(cluster_id)
-            + router.config.fixed_overhead
-            + queue_delay
-            + router.config.prefill_cost_per_token * request.input_length
-            + request.continuation_tokens * router.config.decode_cost_per_token
-            + stale_penalty
-        )
-        if cost < best_cost:
-            best_cost = cost
-            best_cluster = cluster_id
-            best_details = {
-                "network_cost": router.network_cost(cluster_id),
-                "queue_delay": queue_delay,
-                "raw_queue_depth": raw_queue_depth,
-                "estimated_remaining_prefill_tokens": request.input_length,
-                "stale_penalty": stale_penalty,
-                "metadata_age": max(0.0, now - view.summary.created_at) if view is not None else 0.0,
-                "uncertainty_gap": 0,
-                "uncertainty_penalty": 0.0,
-                "missing_summary": 0.0 if view is not None else 1.0,
-                "missing_summary_penalty": 0.0,
-            }
-    return RouteDecision(
-        policy="load_only",
-        cluster_id=best_cluster or next(iter(clusters)),
-        estimated_reusable_tokens=0,
-        predicted_latency=best_cost,
-        details=best_details,
-    )
+    return router.load_only_route(request, clusters.keys(), now)
 
 
 def exact_prefix_policy(
@@ -124,31 +101,18 @@ def exact_prefix_policy(
     for cluster_id, cluster in clusters.items():
         exact_match = cluster.exact_prefix_match(request.prefix_tokens, now)
         estimated_reuse = request_length if exact_match else 0
-        remaining_prefill = request_length - estimated_reuse
         raw_queue_depth = cluster.queue_depth(now)
-        predicted = (
-            router.network_cost(cluster_id)
-            + router.config.fixed_overhead
-            + raw_queue_depth * router.config.queue_depth_penalty
-            + router.config.prefill_cost_per_token * remaining_prefill
-            + request.continuation_tokens * router.config.decode_cost_per_token
+        predicted, details = router.predict_latency(
+            cluster_id=cluster_id,
+            request=request,
+            estimated_reusable_tokens=estimated_reuse,
+            raw_queue_depth=raw_queue_depth,
         )
         if predicted < best_latency:
             best_latency = predicted
             best_cluster = cluster_id
             best_reuse = estimated_reuse
-            best_details = {
-                "network_cost": router.network_cost(cluster_id),
-                "queue_delay": raw_queue_depth * router.config.queue_depth_penalty,
-                "raw_queue_depth": raw_queue_depth,
-                "estimated_remaining_prefill_tokens": remaining_prefill,
-                "stale_penalty": 0.0,
-                "metadata_age": 0.0,
-                "uncertainty_gap": 0,
-                "uncertainty_penalty": 0.0,
-                "missing_summary": 0.0,
-                "missing_summary_penalty": 0.0,
-            }
+            best_details = details
     return RouteDecision(
         policy="exact_prefix",
         cluster_id=best_cluster or next(iter(clusters)),
@@ -173,31 +137,18 @@ def oracle_policy(
     request_length = request.input_length
     for cluster_id, cluster in clusters.items():
         estimated_reuse = cluster.true_reusable_prefix(request.prefix_tokens, now)
-        remaining_prefill = request_length - estimated_reuse
         raw_queue_depth = cluster.queue_depth(now)
-        predicted = (
-            router.network_cost(cluster_id)
-            + router.config.fixed_overhead
-            + raw_queue_depth * router.config.queue_depth_penalty
-            + router.config.prefill_cost_per_token * remaining_prefill
-            + request.continuation_tokens * router.config.decode_cost_per_token
+        predicted, details = router.predict_latency(
+            cluster_id=cluster_id,
+            request=request,
+            estimated_reusable_tokens=estimated_reuse,
+            raw_queue_depth=raw_queue_depth,
         )
         if predicted < best_latency:
             best_latency = predicted
             best_cluster = cluster_id
             best_reuse = estimated_reuse
-            best_details = {
-                "network_cost": router.network_cost(cluster_id),
-                "queue_delay": raw_queue_depth * router.config.queue_depth_penalty,
-                "raw_queue_depth": raw_queue_depth,
-                "estimated_remaining_prefill_tokens": remaining_prefill,
-                "stale_penalty": 0.0,
-                "metadata_age": 0.0,
-                "uncertainty_gap": 0,
-                "uncertainty_penalty": 0.0,
-                "missing_summary": 0.0,
-                "missing_summary_penalty": 0.0,
-            }
+            best_details = details
     return RouteDecision(
         policy="oracle",
         cluster_id=best_cluster or next(iter(clusters)),
@@ -207,10 +158,88 @@ def oracle_policy(
     )
 
 
+def vllm_prefix_mock_policy(
+    router: Router,
+    request: Request,
+    clusters: Mapping[str, Cluster],
+    now: float,
+    rng: random.Random,
+) -> RouteDecision:
+    del rng
+    request_length = request.input_length
+    exact_candidates: list[RouteDecision] = []
+
+    for cluster_id, cluster in clusters.items():
+        exact_match = cluster.exact_prefix_match(request.prefix_tokens, now)
+        if not exact_match:
+            continue
+        raw_queue_depth = cluster.queue_depth(now)
+        predicted, details = router.predict_latency(
+            cluster_id=cluster_id,
+            request=request,
+            estimated_reusable_tokens=request_length,
+            raw_queue_depth=raw_queue_depth,
+        )
+        exact_candidates.append(
+            RouteDecision(
+                policy="vllm_prefix_mock",
+                cluster_id=cluster_id,
+                estimated_reusable_tokens=request_length,
+                predicted_latency=predicted,
+                details=details,
+            )
+        )
+
+    if exact_candidates:
+        return min(exact_candidates, key=lambda candidate: candidate.predicted_latency)
+    return _load_fallback_route(router, request, clusters, now, "vllm_prefix_mock")
+
+
+def vllm_kv_mock_policy(
+    router: Router,
+    request: Request,
+    clusters: Mapping[str, Cluster],
+    now: float,
+    rng: random.Random,
+) -> RouteDecision:
+    del rng
+    best_reuse = -1
+    best_candidates: list[RouteDecision] = []
+
+    for cluster_id, cluster in clusters.items():
+        exact_reuse = cluster.true_reusable_prefix(request.prefix_tokens, now)
+        raw_queue_depth = cluster.queue_depth(now)
+        predicted, details = router.predict_latency(
+            cluster_id=cluster_id,
+            request=request,
+            estimated_reusable_tokens=exact_reuse,
+            raw_queue_depth=raw_queue_depth,
+        )
+        candidate = RouteDecision(
+            policy="vllm_kv_mock",
+            cluster_id=cluster_id,
+            estimated_reusable_tokens=exact_reuse,
+            predicted_latency=predicted,
+            used_fallback=exact_reuse == 0,
+            details=details,
+        )
+        if exact_reuse > best_reuse:
+            best_reuse = exact_reuse
+            best_candidates = [candidate]
+        elif exact_reuse == best_reuse:
+            best_candidates.append(candidate)
+
+    if not best_candidates:
+        return _load_fallback_route(router, request, clusters, now, "vllm_kv_mock")
+    return min(best_candidates, key=lambda candidate: candidate.predicted_latency)
+
+
 POLICIES: Dict[str, PolicyFn] = {
     "summary": summary_policy,
     "random": random_policy,
     "load_only": load_only_policy,
     "exact_prefix": exact_prefix_policy,
     "oracle": oracle_policy,
+    "vllm_prefix_mock": vllm_prefix_mock_policy,
+    "vllm_kv_mock": vllm_kv_mock_policy,
 }

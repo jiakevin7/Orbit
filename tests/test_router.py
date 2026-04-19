@@ -83,7 +83,51 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(decision.cluster_id, "cluster-fast")
         self.assertEqual(decision.estimated_reusable_tokens, 4)
 
+    def test_router_uses_absolute_overlap_threshold_for_long_prompts(self) -> None:
+        cached_cluster = Cluster(
+            "cluster-cached",
+            ClusterConfig(summary_depths=(8, 16)),
+        )
+        empty_cluster = Cluster(
+            "cluster-empty",
+            ClusterConfig(summary_depths=(8, 16)),
+        )
+
+        seed_tokens = tuple(range(100))
+        seed_request = Request(
+            request_id="cached",
+            arrival_time=0.0,
+            router_id="router-a",
+            prefix_tokens=seed_tokens,
+            continuation_tokens=1,
+        )
+        execution = cached_cluster.execute(seed_request)
+        cached_cluster.advance_time(execution.finished_at)
+
+        router = Router(
+            "router-a",
+            {"cluster-cached": 10.0, "cluster-empty": 10.0},
+            RouterConfig(summary_depths=(8, 16)),
+        )
+        router.receive_summary(cached_cluster.publish_summary(execution.finished_at), execution.finished_at, "cluster-cached")
+        router.receive_summary(empty_cluster.publish_summary(execution.finished_at), execution.finished_at, "cluster-empty")
+
+        request_tokens = tuple(list(range(8)) + list(range(1000, 1092)))
+        decision = router.route(
+            Request(
+                request_id="new",
+                arrival_time=execution.finished_at + 1.0,
+                router_id="router-a",
+                prefix_tokens=request_tokens,
+                continuation_tokens=1,
+            ),
+            ["cluster-cached", "cluster-empty"],
+            execution.finished_at + 1.0,
+        )
+
+        self.assertEqual(decision.cluster_id, "cluster-cached")
+        self.assertEqual(decision.estimated_reusable_tokens, 8)
+
 
 if __name__ == "__main__":
     unittest.main()
-

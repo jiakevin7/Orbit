@@ -130,6 +130,83 @@ class CalibrationTests(unittest.TestCase):
         self.assertFalse(calibration.applied)
         self.assertEqual(calibration.reason, "need_at_least_8_records")
 
+    def test_fit_router_config_can_emit_cluster_specific_overrides(self) -> None:
+        base_config = RouterConfig()
+        records: list[ExecutionRecord] = []
+        for index in range(10):
+            records.append(
+                ExecutionRecord(
+                    request_id=f"cluster-0-{index}",
+                    policy="summary",
+                    router_id="router-0",
+                    cluster_id="cluster-0",
+                    arrival_time=float(index),
+                    started_at=float(index),
+                    finished_at=float(index) + 0.5,
+                    predicted_latency=10.0,
+                    actual_latency=0.1 + 0.2 + index * 0.001,
+                    actual_ttft=0.2,
+                    estimated_reusable_tokens=32,
+                    actual_reusable_tokens=32,
+                    estimated_remaining_prefill_tokens=5,
+                    input_length=37,
+                    continuation_tokens=2,
+                    reuse_fraction=0.5,
+                    network_cost=0.1,
+                    queue_delay=0.0,
+                    queue_depth_before=0,
+                    route_queue_depth=0,
+                    metadata_age=0.0,
+                    uncertainty_gap=0,
+                    missing_summary=False,
+                    initial_cluster_id="cluster-0",
+                    had_failover=False,
+                    failover_delay=0.0,
+                    attempt_count=1,
+                    service_time=0.4,
+                )
+            )
+        for index in range(10):
+            records.append(
+                ExecutionRecord(
+                    request_id=f"cluster-1-{index}",
+                    policy="summary",
+                    router_id="router-0",
+                    cluster_id="cluster-1",
+                    arrival_time=float(index),
+                    started_at=float(index),
+                    finished_at=float(index) + 1.1,
+                    predicted_latency=10.0,
+                    actual_latency=0.1 + 0.9 + index * 0.001,
+                    actual_ttft=0.3,
+                    estimated_reusable_tokens=32,
+                    actual_reusable_tokens=32,
+                    estimated_remaining_prefill_tokens=5,
+                    input_length=37,
+                    continuation_tokens=2,
+                    reuse_fraction=0.5,
+                    network_cost=0.1,
+                    queue_delay=0.0,
+                    queue_depth_before=0,
+                    route_queue_depth=0,
+                    metadata_age=0.0,
+                    uncertainty_gap=0,
+                    missing_summary=False,
+                    initial_cluster_id="cluster-1",
+                    had_failover=False,
+                    failover_delay=0.0,
+                    attempt_count=1,
+                    service_time=1.0,
+                )
+            )
+
+        calibrated_config, calibration = fit_router_config(records, base_config, cluster_specific=True)
+
+        self.assertTrue(calibration.applied)
+        self.assertEqual(calibration.scope, "per_cluster")
+        self.assertEqual(set(calibrated_config.cluster_overrides), {"cluster-0", "cluster-1"})
+        self.assertEqual(set(calibration.applied_clusters), {"cluster-0", "cluster-1"})
+
 
 if __name__ == "__main__":
     unittest.main()

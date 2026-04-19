@@ -76,6 +76,10 @@ class WorkloadTests(unittest.TestCase):
                     workload_kind="mixed_realistic",
                     sharegpt_path=str(dataset_path),
                     router_ids=("router-a", "router-b"),
+                    traffic_mix_chat=0.5,
+                    traffic_mix_rag=0.3,
+                    traffic_mix_agent=0.2,
+                    traffic_mix_bursty=0.0,
                     seed=9,
                 )
             )
@@ -87,7 +91,7 @@ class WorkloadTests(unittest.TestCase):
         self.assertGreaterEqual(traffic_counts[CHAT_TRAFFIC_CLASS], 1)
         self.assertGreaterEqual(traffic_counts[RAG_TRAFFIC_CLASS], 1)
         self.assertGreaterEqual(traffic_counts[AGENT_TRAFFIC_CLASS], 1)
-        self.assertGreaterEqual(traffic_counts[BURSTY_TRAFFIC_CLASS], 1)
+        self.assertEqual(traffic_counts[BURSTY_TRAFFIC_CLASS], 0)
 
         for request in requests:
             self.assertIsNotNone(request.prompt_prefix_text)

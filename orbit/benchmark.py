@@ -11,6 +11,7 @@ from typing import Sequence
 from .calibration import fit_router_config
 from .cluster import ClusterConfig
 from .llamacpp import LlamaCppClusterConfig
+from .policies import POLICIES
 from .reporting import (
     execution_records_as_dicts,
     metrics_as_dict,
@@ -21,9 +22,8 @@ from .reporting import (
     write_json,
     write_rows_csv,
 )
-from .simulation import FaultInjectionConfig
+from .simulation import FaultInjectionConfig, Simulation, SimulationConfig
 from .router import RouterConfig
-from .simulation import Simulation, SimulationConfig
 from .workload import WorkloadConfig, generate_workload
 
 
@@ -35,8 +35,35 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Orbit policy benchmarks and export per-request traces",
     )
     parser.add_argument("--backend", choices=("synthetic", "llama_cpp"), default="synthetic")
+    parser.add_argument(
+        "--control-plane-mode",
+        choices=("inprocess", "multiprocess"),
+        default="inprocess",
+        help="execution mode for router and synthetic cluster state",
+    )
+    parser.add_argument(
+        "--control-plane-start-method",
+        default="spawn",
+        help="multiprocessing start method for multiprocess control-plane mode",
+    )
     parser.add_argument("--policies", nargs="+", default=list(DEFAULT_POLICIES))
     parser.add_argument("--requests", type=int, default=200, help="number of requests")
+    parser.add_argument(
+        "--topology-mode",
+        choices=("all_to_all", "sparse_overlap"),
+        default="all_to_all",
+        help="router-to-cluster connectivity model",
+    )
+    parser.add_argument(
+        "--reachable-clusters-per-router",
+        type=int,
+        help="number of clusters each router can reach in sparse_overlap mode",
+    )
+    parser.add_argument(
+        "--continuation-token-cap",
+        type=int,
+        help="optional cap applied to generated continuation token budgets",
+    )
     parser.add_argument(
         "--cache-capacity",
         type=int,
@@ -97,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--calibration-policy",
-        choices=DEFAULT_POLICIES,
+        choices=tuple(POLICIES),
         default="summary",
         help="policy used to collect warm-up traces for router calibration",
     )
@@ -141,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--failure-start", type=float, default=0.0, help="start time of the injected cluster outage window")
     parser.add_argument("--failure-duration", type=float, default=0.0, help="duration of the injected cluster outage window")
     parser.add_argument("--retry-penalty", type=float, default=0.0, help="additional delay before rerouting after an injected cluster failure")
+    parser.add_argument(
+        "--validation-p95-regression-tolerance",
+        type=float,
+        default=0.05,
+        help="maximum relative p95 TTFT/latency regression allowed during validation canary selection",
+    )
     parser.add_argument("--llama-extra-arg", action="append", default=[], help="extra argument forwarded to llama-server")
     return parser
 
@@ -161,6 +194,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--calibrate-router requires --warmup-requests to be greater than zero")
     if args.live_arrival_scale is not None and args.live_arrival_scale <= 0:
         parser.error("--live-arrival-scale must be positive")
+    if args.continuation_token_cap is not None and args.continuation_token_cap <= 0:
+        parser.error("--continuation-token-cap must be positive")
+    if args.reachable_clusters_per_router is not None and args.reachable_clusters_per_router <= 0:
+        parser.error("--reachable-clusters-per-router must be positive")
+    if args.validation_p95_regression_tolerance < 0:
+        parser.error("--validation-p95-regression-tolerance must be non-negative")
     for probability in (args.summary_drop_probability, args.gossip_drop_probability):
         if not 0.0 <= probability <= 1.0:
             parser.error("drop probabilities must be between 0 and 1")
@@ -179,6 +218,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "request_count": args.requests,
         "warmup_requests": args.warmup_requests,
         "validation_requests": args.validation_requests,
+        "router_count": args.routers,
+        "cluster_count": args.clusters,
+        "topology_mode": args.topology_mode,
+        "reachable_clusters_per_router": resolve_reachable_clusters_per_router(args),
+        "continuation_token_cap": args.continuation_token_cap,
         "calibrate_router": args.calibrate_router,
         "calibration_policy": args.calibration_policy,
         "seeds": list(seeds),
@@ -199,6 +243,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "failure_duration": args.failure_duration,
             "retry_penalty": args.retry_penalty,
         },
+        "control_plane_mode": args.control_plane_mode,
+        "control_plane_start_method": args.control_plane_start_method,
+        "calibration_scope": "per_cluster_shadow_canary" if args.calibrate_router else "disabled",
+        "validation_p95_regression_tolerance": args.validation_p95_regression_tolerance,
         "prefix_token_source": "llama_cpp" if args.backend == "llama_cpp" else "synthetic_lexical",
         "live_arrival_scale": resolve_live_arrival_scale(args),
     }
@@ -251,6 +299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 calibration_records,
                 config.router_config,
                 source_policy=args.calibration_policy,
+                cluster_specific=True,
             )
             calibrated_config = replace(config, router_config=calibrated_router_config)
             calibration_payload = asdict(calibration)
@@ -260,18 +309,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected_config = calibrated_config
         selection_payload: dict[str, object] | None = None
         if validation_requests:
-            base_validation_records = replay_policy(config, args.calibration_policy, warmup_requests, validation_requests)
-            calibrated_validation_records = replay_policy(calibrated_config, args.calibration_policy, warmup_requests, validation_requests)
-            base_validation_error = prediction_error_summary(base_validation_records)
-            calibrated_validation_error = prediction_error_summary(calibrated_validation_records)
-            use_calibrated = calibrated_validation_error["mae"] < base_validation_error["mae"]
-            selected_config = calibrated_config if use_calibrated else config
-            selection_payload = {
-                "selected_config": "calibrated" if use_calibrated else "base",
-                "selection_metric": "validation_prediction_mae",
-                "base_validation_error": base_validation_error,
-                "calibrated_validation_error": calibrated_validation_error,
-            }
+            selected_config, selection_payload = select_config_by_validation(
+                base_config=config,
+                calibrated_config=calibrated_config,
+                calibration_policy=args.calibration_policy,
+                warmup_requests=warmup_requests,
+                validation_requests=validation_requests,
+                p95_regression_tolerance=args.validation_p95_regression_tolerance,
+            )
             selection_by_seed[seed] = selection_payload
             write_json(run_dir / "selection.json", selection_payload)
 
@@ -386,8 +431,12 @@ def build_simulation_config(args: argparse.Namespace, seed: int | None = None) -
     cache_token_capacity = resolve_cache_token_capacity(args)
     return SimulationConfig(
         backend=args.backend,
+        control_plane_mode=args.control_plane_mode,
+        control_plane_start_method=args.control_plane_start_method,
         router_ids=router_ids,
         cluster_ids=cluster_ids,
+        topology_mode=args.topology_mode,
+        reachable_clusters_per_router=resolve_reachable_clusters_per_router(args),
         cluster_config=ClusterConfig(
             cache_capacity=args.cache_capacity,
             cache_capacity_tokens=cache_token_capacity,
@@ -422,6 +471,7 @@ def build_simulation_config(args: argparse.Namespace, seed: int | None = None) -
         workload=WorkloadConfig(
             num_requests=args.requests,
             router_ids=router_ids,
+            continuation_token_range=_continuation_token_range(args.continuation_token_cap),
             workload_kind=args.workload_kind,
             sharegpt_path=args.sharegpt_path,
             sharegpt_sample_limit=args.sharegpt_sample_limit,
@@ -433,6 +483,8 @@ def build_simulation_config(args: argparse.Namespace, seed: int | None = None) -
             traffic_mix_rag=args.traffic_mix_rag,
             traffic_mix_agent=args.traffic_mix_agent,
             traffic_mix_bursty=args.traffic_mix_bursty,
+            dataset_continuation_floor=_continuation_floor(args.continuation_token_cap),
+            dataset_continuation_cap=_continuation_cap(args.continuation_token_cap),
             seed=args.seed if seed is None else seed,
         ),
     )
@@ -452,6 +504,28 @@ def resolve_cache_token_capacity(args: argparse.Namespace) -> int | None:
     if args.workload_kind == "mixed_realistic":
         return 4096
     return None
+
+
+def resolve_reachable_clusters_per_router(args: argparse.Namespace) -> int | None:
+    if args.topology_mode != "sparse_overlap":
+        return None
+    if args.reachable_clusters_per_router is not None:
+        return min(args.reachable_clusters_per_router, args.clusters)
+    return min(args.clusters, max(2, -(-args.clusters // max(args.routers, 1)) + 1))
+
+
+def _continuation_cap(cap: int | None) -> int:
+    return cap if cap is not None else 96
+
+
+def _continuation_floor(cap: int | None) -> int:
+    return min(8, _continuation_cap(cap))
+
+
+def _continuation_token_range(cap: int | None) -> tuple[int, int]:
+    upper = min(24, _continuation_cap(cap))
+    lower = min(8, upper)
+    return (lower, upper)
 
 
 def resolve_output_dir(output_dir: str | None) -> Path:
@@ -554,6 +628,105 @@ def replay_policy(
         simulation.close()
 
 
+def select_config_by_validation(
+    base_config: SimulationConfig,
+    calibrated_config: SimulationConfig,
+    calibration_policy: str,
+    warmup_requests: Sequence,
+    validation_requests: Sequence,
+    p95_regression_tolerance: float,
+) -> tuple[SimulationConfig, dict[str, object]]:
+    base_records = replay_policy(base_config, calibration_policy, warmup_requests, validation_requests)
+    base_validation_error = prediction_error_summary(base_records)
+    base_validation_metrics = validation_metrics_summary(base_records)
+
+    payload: dict[str, object] = {
+        "selected_config": "base",
+        "selection_metric": "validation_prediction_mae_with_p95_guardrail",
+        "p95_regression_tolerance": p95_regression_tolerance,
+        "base_validation_error": base_validation_error,
+        "base_validation_metrics": base_validation_metrics,
+    }
+
+    cluster_overrides = dict(calibrated_config.router_config.cluster_overrides)
+    if not cluster_overrides:
+        calibrated_records = replay_policy(calibrated_config, calibration_policy, warmup_requests, validation_requests)
+        calibrated_validation_error = prediction_error_summary(calibrated_records)
+        calibrated_validation_metrics = validation_metrics_summary(calibrated_records)
+        accepted, reasons = validation_candidate_accepted(
+            base_validation_error,
+            base_validation_metrics,
+            calibrated_validation_error,
+            calibrated_validation_metrics,
+            p95_regression_tolerance,
+        )
+        payload["calibrated_validation_error"] = calibrated_validation_error
+        payload["calibrated_validation_metrics"] = calibrated_validation_metrics
+        payload["calibrated_rejection_reasons"] = reasons
+        if accepted:
+            payload["selected_config"] = "calibrated"
+            return calibrated_config, payload
+        return base_config, payload
+
+    cluster_shadow_results: dict[str, object] = {}
+    accepted_cluster_overrides: dict[str, dict[str, float]] = {}
+    for cluster_id, override in sorted(cluster_overrides.items()):
+        cluster_candidate = replace(
+            base_config,
+            router_config=replace(base_config.router_config, cluster_overrides={cluster_id: override}),
+        )
+        cluster_records = replay_policy(cluster_candidate, calibration_policy, warmup_requests, validation_requests)
+        cluster_error = prediction_error_summary(cluster_records)
+        cluster_metrics = validation_metrics_summary(cluster_records)
+        accepted, reasons = validation_candidate_accepted(
+            base_validation_error,
+            base_validation_metrics,
+            cluster_error,
+            cluster_metrics,
+            p95_regression_tolerance,
+        )
+        cluster_shadow_results[cluster_id] = {
+            "accepted": accepted,
+            "validation_error": cluster_error,
+            "validation_metrics": cluster_metrics,
+            "rejection_reasons": reasons,
+        }
+        if accepted:
+            accepted_cluster_overrides[cluster_id] = override
+
+    payload["cluster_shadow_results"] = cluster_shadow_results
+    payload["accepted_clusters"] = sorted(accepted_cluster_overrides)
+    payload["rejected_clusters"] = sorted(cluster_id for cluster_id in cluster_overrides if cluster_id not in accepted_cluster_overrides)
+
+    if not accepted_cluster_overrides:
+        payload["canary_validation_error"] = base_validation_error
+        payload["canary_validation_metrics"] = base_validation_metrics
+        payload["canary_rejection_reasons"] = ["no_cluster_overrides_passed"]
+        return base_config, payload
+
+    canary_config = replace(
+        base_config,
+        router_config=replace(base_config.router_config, cluster_overrides=accepted_cluster_overrides),
+    )
+    canary_records = replay_policy(canary_config, calibration_policy, warmup_requests, validation_requests)
+    canary_validation_error = prediction_error_summary(canary_records)
+    canary_validation_metrics = validation_metrics_summary(canary_records)
+    accepted, reasons = validation_candidate_accepted(
+        base_validation_error,
+        base_validation_metrics,
+        canary_validation_error,
+        canary_validation_metrics,
+        p95_regression_tolerance,
+    )
+    payload["canary_validation_error"] = canary_validation_error
+    payload["canary_validation_metrics"] = canary_validation_metrics
+    payload["canary_rejection_reasons"] = reasons
+    if accepted:
+        payload["selected_config"] = "canary"
+        return canary_config, payload
+    return base_config, payload
+
+
 def prediction_error_summary(records: Sequence) -> dict[str, float]:
     if not records:
         return {"mae": 0.0, "rmse": 0.0}
@@ -561,6 +734,83 @@ def prediction_error_summary(records: Sequence) -> dict[str, float]:
     mae = statistics.fmean(abs(error) for error in errors)
     rmse = (statistics.fmean(error * error for error in errors)) ** 0.5
     return {"mae": mae, "rmse": rmse}
+
+
+def validation_metrics_summary(records: Sequence) -> dict[str, object]:
+    if not records:
+        return {
+            "ttft_p50": 0.0,
+            "ttft_p95": 0.0,
+            "latency_p50": 0.0,
+            "latency_p95": 0.0,
+            "per_cluster": {},
+        }
+    ttfts = sorted(record.actual_ttft for record in records)
+    latencies = sorted(record.actual_latency for record in records)
+    per_cluster: dict[str, dict[str, float]] = {}
+    for cluster_id in sorted({record.cluster_id for record in records}):
+        cluster_records = [record for record in records if record.cluster_id == cluster_id]
+        per_cluster[cluster_id] = {
+            "request_count": float(len(cluster_records)),
+            "ttft_p95": _percentile([record.actual_ttft for record in cluster_records], 0.95),
+            "latency_p95": _percentile([record.actual_latency for record in cluster_records], 0.95),
+        }
+    return {
+        "ttft_p50": _percentile(ttfts, 0.50),
+        "ttft_p95": _percentile(ttfts, 0.95),
+        "latency_p50": _percentile(latencies, 0.50),
+        "latency_p95": _percentile(latencies, 0.95),
+        "per_cluster": per_cluster,
+    }
+
+
+def validation_candidate_accepted(
+    base_error: dict[str, float],
+    base_metrics: dict[str, object],
+    candidate_error: dict[str, float],
+    candidate_metrics: dict[str, object],
+    p95_regression_tolerance: float,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if candidate_error["mae"] >= base_error["mae"]:
+        reasons.append("prediction_mae_not_improved")
+    if _regressed(float(base_metrics["latency_p95"]), float(candidate_metrics["latency_p95"]), p95_regression_tolerance):
+        reasons.append("latency_p95_regressed")
+    if _regressed(float(base_metrics["ttft_p95"]), float(candidate_metrics["ttft_p95"]), p95_regression_tolerance):
+        reasons.append("ttft_p95_regressed")
+
+    base_clusters = base_metrics.get("per_cluster", {})
+    candidate_clusters = candidate_metrics.get("per_cluster", {})
+    if isinstance(base_clusters, dict) and isinstance(candidate_clusters, dict):
+        for cluster_id in sorted(set(base_clusters) & set(candidate_clusters)):
+            base_cluster_metrics = base_clusters[cluster_id]
+            candidate_cluster_metrics = candidate_clusters[cluster_id]
+            if _regressed(
+                float(base_cluster_metrics["latency_p95"]),
+                float(candidate_cluster_metrics["latency_p95"]),
+                p95_regression_tolerance,
+            ):
+                reasons.append(f"cluster_{cluster_id}_latency_p95_regressed")
+    return len(reasons) == 0, reasons
+
+
+def _regressed(base_value: float, candidate_value: float, tolerance: float) -> bool:
+    if base_value <= 0.0:
+        return candidate_value > base_value
+    return candidate_value > base_value * (1.0 + tolerance)
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = quantile * (len(ordered) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    weight = position - lower_index
+    return ordered[lower_index] * (1.0 - weight) + ordered[upper_index] * weight
 
 
 if __name__ == "__main__":

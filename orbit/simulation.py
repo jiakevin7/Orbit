@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import statistics
 import time
@@ -9,9 +10,10 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, Iterable, Sequence
 
 from .cluster import Cluster, ClusterConfig
-from .llamacpp import LlamaCppCluster, LlamaCppClusterConfig
+from .llamacpp import LlamaCppCluster, LlamaCppClusterConfig, ManagedLlamaCppServer
 from .models import ExecutionRecord, Request, SimulationMetrics
 from .policies import POLICIES
+from .process_plane import ProcessClusterProxy, ProcessLlamaCppClusterProxy, ProcessRouterProxy
 from .router import Router, RouterConfig
 from .workload import WorkloadConfig, generate_workload
 
@@ -31,8 +33,12 @@ class FaultInjectionConfig:
 @dataclass(frozen=True)
 class SimulationConfig:
     backend: str = "synthetic"
+    control_plane_mode: str = "inprocess"
+    control_plane_start_method: str = "spawn"
     router_ids: tuple[str, ...] = ("router-a", "router-b")
     cluster_ids: tuple[str, ...] = ("cluster-a", "cluster-b", "cluster-c")
+    topology_mode: str = "all_to_all"
+    reachable_clusters_per_router: int | None = None
     cluster_config: ClusterConfig = field(default_factory=ClusterConfig)
     llama_cpp: LlamaCppClusterConfig | None = None
     router_config: RouterConfig = field(default_factory=RouterConfig)
@@ -46,20 +52,91 @@ class SimulationConfig:
     faults: FaultInjectionConfig = field(default_factory=FaultInjectionConfig)
 
 
+def default_network_costs(
+    *,
+    router_ids: Sequence[str],
+    cluster_ids: Sequence[str],
+    backend: str,
+    topology_mode: str = "all_to_all",
+    reachable_clusters_per_router: int | None = None,
+) -> Dict[str, Dict[str, float]]:
+    if not router_ids:
+        raise ValueError("topology requires at least one router")
+    if not cluster_ids:
+        raise ValueError("topology requires at least one cluster")
+
+    local_cost = 5.0
+    remote_step = 20.0
+    if backend == "llama_cpp":
+        local_cost = 0.005
+        remote_step = 0.020
+
+    if topology_mode == "all_to_all":
+        network_costs: Dict[str, Dict[str, float]] = {}
+        for router_index, router_id in enumerate(router_ids):
+            router_costs: Dict[str, float] = {}
+            for cluster_index, cluster_id in enumerate(cluster_ids):
+                distance = abs(router_index - cluster_index)
+                router_costs[cluster_id] = local_cost + distance * remote_step
+            network_costs[router_id] = router_costs
+        return network_costs
+
+    if topology_mode != "sparse_overlap":
+        raise ValueError(f"unsupported topology_mode: {topology_mode}")
+
+    router_count = len(router_ids)
+    cluster_count = len(cluster_ids)
+    degree = reachable_clusters_per_router
+    if degree is None:
+        degree = min(cluster_count, max(2, math.ceil(cluster_count / router_count) + 1))
+    if degree <= 0:
+        raise ValueError("reachable_clusters_per_router must be positive")
+    if degree > cluster_count:
+        raise ValueError("reachable_clusters_per_router cannot exceed cluster count")
+
+    network_costs = {}
+    for router_index, router_id in enumerate(router_ids):
+        start = int(math.floor(router_index * cluster_count / router_count)) % cluster_count
+        router_costs: Dict[str, float] = {}
+        for offset in range(degree):
+            cluster_index = (start + offset) % cluster_count
+            cluster_id = cluster_ids[cluster_index]
+            router_costs[cluster_id] = local_cost + offset * remote_step
+        network_costs[router_id] = router_costs
+    return network_costs
+
+
+def infer_home_router_for_cluster(
+    *,
+    router_ids: Sequence[str],
+    cluster_ids: Sequence[str],
+    network_costs: Dict[str, Dict[str, float]],
+) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for cluster_id in cluster_ids:
+        reachable_routers = [
+            router_id
+            for router_id in router_ids
+            if cluster_id in network_costs.get(router_id, {})
+        ]
+        if not reachable_routers:
+            raise ValueError(f"cluster {cluster_id} is unreachable from every router")
+        mapping[cluster_id] = min(
+            reachable_routers,
+            key=lambda router_id: network_costs[router_id][cluster_id],
+        )
+    return mapping
+
+
 class Simulation:
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
         self.network_costs = self._build_network_costs()
+        self._validate_topology()
         self.home_router_for_cluster = self._build_home_router_map()
+        self._managed_llama_servers: list[ManagedLlamaCppServer] = []
         self.clusters = self._build_clusters()
-        self.routers = {
-            router_id: Router(
-                router_id,
-                network_costs=self.network_costs[router_id],
-                config=self.config.router_config,
-            )
-            for router_id in self.config.router_ids
-        }
+        self.routers = self._build_routers()
         self._next_summary_due = {cluster_id: 0.0 for cluster_id in self.config.cluster_ids}
         self._next_gossip_at = 0.0
         self._pending_deliveries: list[tuple[float, int, str, object, str]] = []
@@ -71,6 +148,13 @@ class Simulation:
     def close(self) -> None:
         for cluster in self.clusters.values():
             close = getattr(cluster, "close", None)
+            if callable(close):
+                close()
+        for server in self._managed_llama_servers:
+            server.stop()
+        self._managed_llama_servers.clear()
+        for router in self.routers.values():
+            close = getattr(router, "close", None)
             if callable(close):
                 close()
         self._live_time_origin = None
@@ -157,19 +241,61 @@ class Simulation:
                     )
                 )
                 cluster_counts[decision.cluster_id] += 1
+
+            metrics = self._compute_metrics(
+                policy_name,
+                records,
+                cluster_counts,
+                control_plane_bytes=self.control_plane_bytes - control_plane_bytes_start,
+            )
+            return records, metrics
         finally:
             if close_on_finish:
                 self.close()
 
-        metrics = self._compute_metrics(
-            policy_name,
-            records,
-            cluster_counts,
-            control_plane_bytes=self.control_plane_bytes - control_plane_bytes_start,
-        )
-        return records, metrics
-
     def _build_clusters(self) -> Dict[str, object]:
+        if self.config.control_plane_mode == "multiprocess":
+            if self.config.backend == "llama_cpp":
+                if self.config.llama_cpp is None:
+                    raise ValueError("llama_cpp backend requires llama_cpp configuration")
+                clusters: Dict[str, object] = {}
+                for index, cluster_id in enumerate(self.config.cluster_ids):
+                    backend_config = self.config.llama_cpp.for_cluster(index)
+                    if backend_config.manage_server:
+                        server = ManagedLlamaCppServer(backend_config)
+                        server.start()
+                        self._managed_llama_servers.append(server)
+                        backend_config = LlamaCppClusterConfig(
+                            model_path=backend_config.model_path,
+                            executable=backend_config.executable,
+                            host=backend_config.host,
+                            port_base=backend_config.port_base,
+                            threads=backend_config.threads,
+                            ctx_size=backend_config.ctx_size,
+                            parallel=backend_config.parallel,
+                            request_timeout=backend_config.request_timeout,
+                            startup_timeout=backend_config.startup_timeout,
+                            temperature=backend_config.temperature,
+                            top_p=backend_config.top_p,
+                            seed=backend_config.seed,
+                            manage_server=False,
+                            extra_args=backend_config.extra_args,
+                        )
+                    clusters[cluster_id] = ProcessLlamaCppClusterProxy(
+                        cluster_id=cluster_id,
+                        cluster_config=self.config.cluster_config,
+                        backend_config=backend_config,
+                        start_method=self.config.control_plane_start_method,
+                    )
+                return clusters
+            return {
+                cluster_id: ProcessClusterProxy(
+                    cluster_id=cluster_id,
+                    config=self.config.cluster_config,
+                    start_method=self.config.control_plane_start_method,
+                )
+                for cluster_id in self.config.cluster_ids
+            }
         if self.config.backend == "synthetic":
             return {
                 cluster_id: Cluster(cluster_id, self.config.cluster_config)
@@ -187,6 +313,26 @@ class Simulation:
                 )
             return clusters
         raise ValueError(f"unsupported backend: {self.config.backend}")
+
+    def _build_routers(self) -> Dict[str, object]:
+        if self.config.control_plane_mode == "multiprocess":
+            return {
+                router_id: ProcessRouterProxy(
+                    router_id=router_id,
+                    network_costs=self.network_costs[router_id],
+                    config=self.config.router_config,
+                    start_method=self.config.control_plane_start_method,
+                )
+                for router_id in self.config.router_ids
+            }
+        return {
+            router_id: Router(
+                router_id,
+                network_costs=self.network_costs[router_id],
+                config=self.config.router_config,
+            )
+            for router_id in self.config.router_ids
+        }
 
     def _prepare_requests_for_backend(self, requests: Sequence[Request]) -> list[Request]:
         prepared = list(requests)
@@ -225,33 +371,81 @@ class Simulation:
                 router_id: dict(cluster_costs)
                 for router_id, cluster_costs in self.config.network_costs.items()
             }
-
-        local_cost = 5.0
-        remote_step = 20.0
-        if self.config.backend == "llama_cpp":
-            # The synthetic simulator uses abstract latency units. For live llama.cpp
-            # measurements, convert the default topology costs to seconds.
-            local_cost = 0.005
-            remote_step = 0.020
-
-        network_costs: Dict[str, Dict[str, float]] = {}
-        for router_index, router_id in enumerate(self.config.router_ids):
-            router_costs: Dict[str, float] = {}
-            for cluster_index, cluster_id in enumerate(self.config.cluster_ids):
-                distance = abs(router_index - cluster_index)
-                router_costs[cluster_id] = local_cost + distance * remote_step
-            network_costs[router_id] = router_costs
-        return network_costs
+        return default_network_costs(
+            router_ids=self.config.router_ids,
+            cluster_ids=self.config.cluster_ids,
+            backend=self.config.backend,
+            topology_mode=self.config.topology_mode,
+            reachable_clusters_per_router=self.config.reachable_clusters_per_router,
+        )
 
     def _build_home_router_map(self) -> Dict[str, str]:
         if self.config.home_router_for_cluster:
-            return dict(self.config.home_router_for_cluster)
+            mapping = dict(self.config.home_router_for_cluster)
+        else:
+            mapping = infer_home_router_for_cluster(
+                router_ids=self.config.router_ids,
+                cluster_ids=self.config.cluster_ids,
+                network_costs=self.network_costs,
+            )
 
-        mapping: Dict[str, str] = {}
-        router_count = len(self.config.router_ids)
-        for index, cluster_id in enumerate(self.config.cluster_ids):
-            mapping[cluster_id] = self.config.router_ids[index % router_count]
+        for cluster_id, router_id in mapping.items():
+            if cluster_id not in self.config.cluster_ids:
+                raise ValueError(f"unknown cluster in home_router_for_cluster: {cluster_id}")
+            if router_id not in self.config.router_ids:
+                raise ValueError(f"unknown router in home_router_for_cluster: {router_id}")
+            if cluster_id not in self.network_costs.get(router_id, {}):
+                raise ValueError(
+                    f"home router {router_id} cannot reach cluster {cluster_id}"
+                )
         return mapping
+
+    def _validate_topology(self) -> None:
+        unknown_routers = sorted(set(self.network_costs) - set(self.config.router_ids))
+        if unknown_routers:
+            raise ValueError(f"network_costs contains unknown routers: {', '.join(unknown_routers)}")
+
+        for router_id in self.config.router_ids:
+            router_costs = self.network_costs.get(router_id)
+            if router_costs is None:
+                raise ValueError(f"missing network_costs entry for router {router_id}")
+            if not router_costs:
+                raise ValueError(f"router {router_id} cannot reach any cluster")
+            unknown_clusters = sorted(set(router_costs) - set(self.config.cluster_ids))
+            if unknown_clusters:
+                raise ValueError(
+                    f"network_costs for {router_id} contains unknown clusters: {', '.join(unknown_clusters)}"
+                )
+        for cluster_id in self.config.cluster_ids:
+            if not any(cluster_id in self.network_costs[router_id] for router_id in self.config.router_ids):
+                raise ValueError(f"cluster {cluster_id} is unreachable from every router")
+
+    def _reachable_cluster_ids(self, router_id: str) -> tuple[str, ...]:
+        router_costs = self.network_costs.get(router_id, {})
+        return tuple(cluster_id for cluster_id in self.config.cluster_ids if cluster_id in router_costs)
+
+    def _direct_router_ids_for_cluster(self, cluster_id: str) -> tuple[str, ...]:
+        return tuple(
+            router_id
+            for router_id in self.config.router_ids
+            if cluster_id in self.network_costs.get(router_id, {})
+        )
+
+    def _reachable_clusters(
+        self,
+        router_id: str,
+        now: float,
+        *,
+        exclude: set[str] | None = None,
+        only_available: bool = False,
+    ) -> Dict[str, object]:
+        exclude = exclude or set()
+        return {
+            cluster_id: self.clusters[cluster_id]
+            for cluster_id in self._reachable_cluster_ids(router_id)
+            if cluster_id not in exclude
+            and (not only_available or self._cluster_is_available(cluster_id, now))
+        }
 
     def _process_control_plane_until(self, now: float) -> None:
         while True:
@@ -393,18 +587,17 @@ class Simulation:
                         failover_delay=failover_delay,
                         attempt_count=attempt_count,
                     )
+            records = [records_by_index[index] for index in range(len(workload))]
+            metrics = self._compute_metrics(
+                policy_name,
+                records,
+                cluster_counts,
+                control_plane_bytes=self.control_plane_bytes - control_plane_bytes_start,
+            )
+            return records, metrics
         finally:
             if close_on_finish:
                 self.close()
-
-        records = [records_by_index[index] for index in range(len(workload))]
-        metrics = self._compute_metrics(
-            policy_name,
-            records,
-            cluster_counts,
-            control_plane_bytes=self.control_plane_bytes - control_plane_bytes_start,
-        )
-        return records, metrics
 
     def _build_execution_record(
         self,
@@ -516,7 +709,10 @@ class Simulation:
 
         summary_memory_bytes = 0
         for router in self.routers.values():
-            summary_memory_bytes += sum(view.summary.byte_size for view in router.views.values())
+            if hasattr(router, "summary_memory_bytes"):
+                summary_memory_bytes += int(router.summary_memory_bytes())
+            else:
+                summary_memory_bytes += sum(view.summary.byte_size for view in router.views.values())
 
         return SimulationMetrics(
             policy=policy_name,
@@ -542,10 +738,13 @@ class Simulation:
         request: Request,
         now: float,
     ) -> tuple[Request, object, str, bool, float, int]:
+        reachable_clusters = self._reachable_clusters(router.router_id, now)
+        if not reachable_clusters:
+            raise RuntimeError(f"router {router.router_id} has no reachable clusters")
         decision = POLICIES[policy_name](
             router,
             request,
-            self.clusters,
+            reachable_clusters,
             now,
             self.rng,
         )
@@ -553,7 +752,12 @@ class Simulation:
         if self._cluster_is_available(decision.cluster_id, now):
             return request, decision, initial_cluster_id, False, 0.0, 1
 
-        available_clusters = self._available_clusters(now, exclude={decision.cluster_id})
+        available_clusters = self._reachable_clusters(
+            router.router_id,
+            now,
+            exclude={decision.cluster_id},
+            only_available=True,
+        )
         if not available_clusters:
             raise RuntimeError("no clusters available to fail over after injected outage")
 
@@ -608,9 +812,10 @@ class Simulation:
 
 def run_policies(
     config: SimulationConfig | None = None,
-    policy_names: Iterable[str] = ("summary", "random", "load_only", "exact_prefix", "oracle"),
+    policy_names: Iterable[str] | None = None,
 ) -> Dict[str, SimulationMetrics]:
     config = config or SimulationConfig()
+    policy_names = tuple(policy_names or POLICIES)
     requests = generate_workload(config.workload)
     results: Dict[str, SimulationMetrics] = {}
     for policy_name in policy_names:

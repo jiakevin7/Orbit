@@ -5,10 +5,15 @@ import unittest
 
 from orbit.benchmark import (
     aggregate_summary_rows,
+    build_simulation_config,
     flatten_metrics_row,
+    resolve_reachable_clusters_per_router,
+    validation_candidate_accepted,
+    validation_metrics_summary,
     resolve_cache_token_capacity,
     split_workload,
 )
+from orbit.models import ExecutionRecord
 from orbit.models import Request
 
 
@@ -85,6 +90,210 @@ class BenchmarkTests(unittest.TestCase):
 
         args = argparse.Namespace(cache_token_capacity=None, workload_kind="synthetic")
         self.assertIsNone(resolve_cache_token_capacity(args))
+
+    def test_resolve_reachable_clusters_per_router_uses_sparse_default(self) -> None:
+        args = argparse.Namespace(
+            topology_mode="sparse_overlap",
+            reachable_clusters_per_router=None,
+            routers=4,
+            clusters=6,
+        )
+        self.assertEqual(resolve_reachable_clusters_per_router(args), 3)
+
+        args = argparse.Namespace(
+            topology_mode="all_to_all",
+            reachable_clusters_per_router=2,
+            routers=4,
+            clusters=6,
+        )
+        self.assertIsNone(resolve_reachable_clusters_per_router(args))
+
+    def test_build_simulation_config_records_sparse_topology(self) -> None:
+        args = argparse.Namespace(
+            backend="synthetic",
+            control_plane_mode="inprocess",
+            control_plane_start_method="spawn",
+            routers=4,
+            clusters=6,
+            topology_mode="sparse_overlap",
+            reachable_clusters_per_router=3,
+            cache_capacity=256,
+            cache_token_capacity=None,
+            model=None,
+            llama_executable="llama-server",
+            llama_port_base=8081,
+            llama_threads=4,
+            llama_ctx_size=4096,
+            llama_parallel=1,
+            llama_timeout=120.0,
+            llama_startup_timeout=120.0,
+            llama_extra_arg=[],
+            workload_kind="mixed_realistic",
+            requests=32,
+            continuation_token_cap=None,
+            sharegpt_path=None,
+            sharegpt_sample_limit=100,
+            rag_path=None,
+            rag_sample_limit=100,
+            agent_path=None,
+            agent_sample_limit=100,
+            traffic_mix_chat=0.35,
+            traffic_mix_rag=0.25,
+            traffic_mix_agent=0.20,
+            traffic_mix_bursty=0.20,
+            seed=7,
+            live_arrival_scale=None,
+            summary_delay=0.0,
+            gossip_delay=0.0,
+            summary_drop_probability=0.0,
+            gossip_drop_probability=0.0,
+            failed_clusters=[],
+            failure_start=0.0,
+            failure_duration=0.0,
+            retry_penalty=0.0,
+        )
+
+        config = build_simulation_config(args)
+
+        self.assertEqual(config.topology_mode, "sparse_overlap")
+        self.assertEqual(config.reachable_clusters_per_router, 3)
+
+    def test_validation_guardrail_rejects_p95_regression(self) -> None:
+        base_records = [
+            ExecutionRecord(
+                request_id="base-0",
+                policy="summary",
+                router_id="router-0",
+                cluster_id="cluster-0",
+                arrival_time=0.0,
+                started_at=0.0,
+                finished_at=1.0,
+                predicted_latency=1.0,
+                actual_latency=1.0,
+                actual_ttft=0.5,
+                estimated_reusable_tokens=0,
+                actual_reusable_tokens=0,
+                estimated_remaining_prefill_tokens=10,
+                input_length=10,
+                continuation_tokens=4,
+                reuse_fraction=0.0,
+                network_cost=0.0,
+                queue_delay=0.0,
+                queue_depth_before=0,
+                route_queue_depth=0,
+                metadata_age=0.0,
+                uncertainty_gap=0,
+                missing_summary=False,
+                initial_cluster_id="cluster-0",
+                had_failover=False,
+                failover_delay=0.0,
+                attempt_count=1,
+                service_time=1.0,
+            ),
+            ExecutionRecord(
+                request_id="base-1",
+                policy="summary",
+                router_id="router-0",
+                cluster_id="cluster-0",
+                arrival_time=1.0,
+                started_at=1.0,
+                finished_at=2.0,
+                predicted_latency=1.1,
+                actual_latency=1.1,
+                actual_ttft=0.55,
+                estimated_reusable_tokens=0,
+                actual_reusable_tokens=0,
+                estimated_remaining_prefill_tokens=10,
+                input_length=10,
+                continuation_tokens=4,
+                reuse_fraction=0.0,
+                network_cost=0.0,
+                queue_delay=0.0,
+                queue_depth_before=0,
+                route_queue_depth=0,
+                metadata_age=0.0,
+                uncertainty_gap=0,
+                missing_summary=False,
+                initial_cluster_id="cluster-0",
+                had_failover=False,
+                failover_delay=0.0,
+                attempt_count=1,
+                service_time=1.1,
+            ),
+        ]
+        candidate_records = [
+            ExecutionRecord(
+                request_id="cand-0",
+                policy="summary",
+                router_id="router-0",
+                cluster_id="cluster-0",
+                arrival_time=0.0,
+                started_at=0.0,
+                finished_at=1.3,
+                predicted_latency=1.01,
+                actual_latency=1.3,
+                actual_ttft=0.8,
+                estimated_reusable_tokens=0,
+                actual_reusable_tokens=0,
+                estimated_remaining_prefill_tokens=10,
+                input_length=10,
+                continuation_tokens=4,
+                reuse_fraction=0.0,
+                network_cost=0.0,
+                queue_delay=0.0,
+                queue_depth_before=0,
+                route_queue_depth=0,
+                metadata_age=0.0,
+                uncertainty_gap=0,
+                missing_summary=False,
+                initial_cluster_id="cluster-0",
+                had_failover=False,
+                failover_delay=0.0,
+                attempt_count=1,
+                service_time=1.3,
+            ),
+            ExecutionRecord(
+                request_id="cand-1",
+                policy="summary",
+                router_id="router-0",
+                cluster_id="cluster-0",
+                arrival_time=1.0,
+                started_at=1.0,
+                finished_at=2.4,
+                predicted_latency=1.09,
+                actual_latency=1.4,
+                actual_ttft=0.82,
+                estimated_reusable_tokens=0,
+                actual_reusable_tokens=0,
+                estimated_remaining_prefill_tokens=10,
+                input_length=10,
+                continuation_tokens=4,
+                reuse_fraction=0.0,
+                network_cost=0.0,
+                queue_delay=0.0,
+                queue_depth_before=0,
+                route_queue_depth=0,
+                metadata_age=0.0,
+                uncertainty_gap=0,
+                missing_summary=False,
+                initial_cluster_id="cluster-0",
+                had_failover=False,
+                failover_delay=0.0,
+                attempt_count=1,
+                service_time=1.4,
+            ),
+        ]
+
+        accepted, reasons = validation_candidate_accepted(
+            {"mae": 0.1, "rmse": 0.1},
+            validation_metrics_summary(base_records),
+            {"mae": 0.01, "rmse": 0.01},
+            validation_metrics_summary(candidate_records),
+            p95_regression_tolerance=0.05,
+        )
+
+        self.assertFalse(accepted)
+        self.assertIn("latency_p95_regressed", reasons)
 
 
 if __name__ == "__main__":

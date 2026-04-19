@@ -16,6 +16,9 @@ Since the initial fresh-start design, Orbit now includes:
 - realistic workload generation across synthetic, ShareGPT-style chat, RAG, agent/tool, and bursty session traffic, with dataset adapters for BFCL-, tau-bench-, ToolBench-, LMSYS-, and FinanceBench-like shapes
 - evaluation tooling beyond raw policy comparison, including warm-up slices, held-out validation, router calibration, grouped traffic/source summaries, multi-seed aggregation, and bootstrap confidence intervals
 - robustness testing hooks for stale or dropped control-plane updates, injected cluster outages, and failover accounting
+- optional multiprocess control-plane execution, where routers and synthetic or live clusters run as real worker processes rather than sharing one in-process object graph
+- cluster-specific router calibration with shadow validation and canary-style rollback guards on p95 latency and TTFT
+- a standard external benchmark matrix runner for chat, RAG, agent/tool, bursty, and mixed realistic scenarios with multi-seed root summaries
 - a run visualizer that turns each benchmark directory into a self-contained HTML report
 - packaged bash entrypoints for compare runs, synthetic benchmarks, live benchmarks, visualization, and CI checks
 
@@ -49,10 +52,15 @@ The simulator is intentionally compact. It models:
 - `orbit/router.py`: router soft-state, reuse estimation, and latency prediction
 - `orbit/workload.py`: synthetic and mixed realistic workloads, including ShareGPT, BFCL, tau-bench, and related dataset ingestion
 - `orbit/calibration.py`: fit router latency coefficients from observed traces
+- `orbit/process_plane.py`: process-backed router and synthetic cluster proxies
+- `orbit/matrix.py`: standard external benchmark matrix loading and root-level aggregation helpers
+- `orbit/related_work.py`: black-box benchmark client and lifecycle helpers for deployed related-work systems
 - `orbit/visualizer.py`: generate self-contained HTML reports from benchmark artifacts
 - `orbit/simulation.py`: control-plane events, request execution, and metrics
 - `orbit/policies.py`: baseline routing policies
 - `DATASETS.md`: recommended public datasets and how they map to Orbit traffic classes
+- `configs/external_benchmark_matrix.json`: standard scenario matrix for larger external sweeps
+- `configs/related_work_targets.example.json`: example target list for vLLM, SGLang, LMCache, Preble, and DistServe comparisons
 - `ROADMAP.md`: production-realism upgrades in priority order
 
 ## Run
@@ -87,7 +95,34 @@ python -m orbit \
   --clusters 2
 ```
 
+Run the synthetic path with routers and clusters isolated in real worker processes:
+
+```bash
+python -m orbit \
+  --backend synthetic \
+  --control-plane-mode multiprocess \
+  --compare \
+  --requests 40 \
+  --warmup-requests 10 \
+  --validation-requests 10
+```
+
+Run the live `llama.cpp` path with multiprocess routers/clusters:
+
+```bash
+python -m orbit \
+  --backend llama_cpp \
+  --control-plane-mode multiprocess \
+  --model /absolute/path/to/model.gguf \
+  --policy summary \
+  --requests 20 \
+  --live-arrival-scale 0.01 \
+  --clusters 2
+```
+
 In `llama.cpp` mode, Orbit retokenizes prompts through the backend `/tokenize` API before routing, so the trie, Bloom summaries, and router decisions all operate on the same token sequence the model executes. Cluster execution time, TTFT, prompt-progress cache visibility, and queue delay come from real streamed requests to one `llama-server` process per cluster. The benchmark driver replays arrivals concurrently in wall clock time; by default it applies `--live-arrival-scale 0.01` so realistic overlap appears without forcing multi-minute runs.
+
+When `--control-plane-mode multiprocess` is used with `--backend llama_cpp`, Orbit launches the `llama-server` processes from the parent benchmark process and keeps router and cluster cache/control-plane state inside worker processes. That avoids nesting server startup inside worker-owned subprocess trees while still separating routing state from the main driver.
 
 Export a full multi-policy benchmark with per-request traces:
 
@@ -140,7 +175,58 @@ python3 scripts/benchmark_policies.py \
   --output-dir results/heldout-benchmark
 ```
 
-When `--validation-requests` is non-zero, Orbit replays both router configs on the validation slice, compares prediction MAE, and writes `selection.json` with the chosen config.
+When `--validation-requests` is non-zero, Orbit now uses a shadow/canary selection path. It evaluates single-cluster override candidates first, rejects any candidate that regresses p95 latency or TTFT beyond `--validation-p95-regression-tolerance`, then validates the combined canary config before writing `selection.json`.
+
+Run the standard external benchmark matrix:
+
+```bash
+python3 scripts/run_external_matrix.py \
+  --backend synthetic \
+  --control-plane-mode multiprocess \
+  --sharegpt-path /absolute/path/to/sharegpt.json \
+  --rag-path /absolute/path/to/rag.json \
+  --agent-path /absolute/path/to/agent.json \
+  --output-dir results/external-matrix
+```
+
+or with the bash wrapper:
+
+```bash
+bash scripts/run_external_matrix.sh \
+  --backend synthetic \
+  --control-plane-mode multiprocess \
+  --sharegpt-path /absolute/path/to/sharegpt.json \
+  --rag-path /absolute/path/to/rag.json \
+  --agent-path /absolute/path/to/agent.json
+```
+
+The matrix runner executes the standard scenarios defined in `configs/external_benchmark_matrix.json`, writes one benchmark directory per scenario, and emits root-level `matrix_manifest.json`, `matrix_summary.json`, and `matrix_summary.csv`.
+
+Benchmark Orbit directly against deployed related-work systems on the same workload:
+
+```bash
+python3 scripts/benchmark_related_work.py \
+  --target-config configs/related_work_targets.example.json \
+  --backend llama_cpp \
+  --model /absolute/path/to/model.gguf \
+  --workload-kind mixed_realistic \
+  --sharegpt-path /absolute/path/to/sharegpt.json \
+  --rag-path /absolute/path/to/rag.json \
+  --agent-path /absolute/path/to/agent.json \
+  --requests 32 \
+  --warmup-requests 8 \
+  --output-dir results/related-work
+```
+
+or with the bash wrapper:
+
+```bash
+bash scripts/run_related_work.sh \
+  --backend llama_cpp \
+  --model /absolute/path/to/model.gguf
+```
+
+The related-work runner generates one shared workload, replays it locally through the selected Orbit policies, then replays the same scheduled arrivals against each configured external endpoint. Each external target is treated as a black-box service, so this path is best suited to deployed systems that expose OpenAI-compatible chat or completion APIs. If a target needs a clean cache before each run, add `process.reset_command`, `process.startup_command`, or `process.shutdown_command` entries to the target config.
 
 Run the mixed realistic workload with external chat, RAG, agent/tool, and bursty traffic:
 
@@ -227,6 +313,7 @@ The benchmark runner writes:
 - `manifest.json`: benchmark config and run metadata
 - `calibration.json`: fitted router coefficients when `--calibrate-router` is used
 - `selection.json`: held-out base-vs-calibrated selection details when `--validation-requests` is used
+- `matrix_manifest.json`, `matrix_summary.json`, and `matrix_summary.csv`: root-level scenario manifest and aggregated outputs from `scripts/run_external_matrix.py`
 - `workload.json`: the full shared request stream used for all policies, including the final routed token sequence, scaled arrival times, traffic class, and session metadata
 - `warmup_workload.json`: the warm-up subset when `--warmup-requests` is used
 - `validation_workload.json`: the held-out validation subset when `--validation-requests` is used
@@ -278,6 +365,7 @@ bash scripts/run_ci_checks.sh --with-live
 - [scripts/run_compare.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/run_compare.sh): quick `python -m orbit --compare` wrapper
 - [scripts/run_benchmark_synthetic.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/run_benchmark_synthetic.sh): synthetic or mixed-realistic benchmark run plus HTML report generation
 - [scripts/run_benchmark_live.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/run_benchmark_live.sh): `llama.cpp` benchmark run plus HTML report generation
+- [scripts/run_related_work.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/run_related_work.sh): compare Orbit against deployed related-work systems from a JSON target list
 - [scripts/visualize_run.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/visualize_run.sh): wrapper for the run visualizer
 - [scripts/generate_png_plots.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/generate_png_plots.sh): wrapper for generating seaborn PNG plots only
 - [scripts/run_ci_checks.sh](/Users/baseb/Documents/6th%20Year/CSE%20585/Orbit/scripts/run_ci_checks.sh): unit-only or live CI-style verification entrypoint

@@ -11,7 +11,7 @@ from orbit.png_plots import generate_run_plots
 
 @unittest.skipUnless(importlib.util.find_spec("seaborn") is not None, "seaborn is not installed")
 class PngPlotTests(unittest.TestCase):
-    def test_generate_run_plots_writes_ttft_cdf_and_related_pngs(self) -> None:
+    def test_generate_run_plots_writes_curated_research_pngs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_dir = Path(tmpdir)
             (run_dir / "manifest.json").write_text(
@@ -78,15 +78,21 @@ class PngPlotTests(unittest.TestCase):
             expected = {
                 (run_dir / "plots" / "ttft_cdf.png").resolve(),
                 (run_dir / "plots" / "latency_cdf.png").resolve(),
+                (run_dir / "plots" / "ttft_by_policy.png").resolve(),
+                (run_dir / "plots" / "latency_by_policy.png").resolve(),
+                (run_dir / "plots" / "reuse_latency_tradeoff.png").resolve(),
+            }
+            unexpected = {
                 (run_dir / "plots" / "reuse_fraction_distribution.png").resolve(),
                 (run_dir / "plots" / "predicted_vs_actual_latency.png").resolve(),
-                (run_dir / "plots" / "ttft_by_policy.png").resolve(),
                 (run_dir / "plots" / "cluster_assignment.png").resolve(),
                 (run_dir / "plots" / "failover_distribution.png").resolve(),
             }
             self.assertTrue(expected.issubset(set(created)))
             for path in expected:
                 self.assertTrue(path.exists(), f"missing plot {path}")
+            for path in unexpected:
+                self.assertFalse(path.exists(), f"unexpected plot {path}")
 
 
 if __name__ == "__main__":

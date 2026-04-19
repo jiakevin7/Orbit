@@ -7,9 +7,19 @@ from pathlib import Path
 from typing import Mapping
 
 
-POLICY_ORDER = ("summary", "load_only", "random", "exact_prefix", "oracle")
+POLICY_ORDER = (
+    "summary",
+    "vllm_prefix_mock",
+    "vllm_kv_mock",
+    "load_only",
+    "random",
+    "exact_prefix",
+    "oracle",
+)
 POLICY_LABELS = {
     "summary": "Summary Router",
+    "vllm_prefix_mock": "vLLM Prefix Mock",
+    "vllm_kv_mock": "vLLM KV Mock",
     "load_only": "Load Only",
     "random": "Random",
     "exact_prefix": "Exact Prefix",
@@ -17,6 +27,8 @@ POLICY_LABELS = {
 }
 POLICY_PALETTE = {
     "summary": "#1d4ed8",
+    "vllm_prefix_mock": "#0f766e",
+    "vllm_kv_mock": "#7c3aed",
     "load_only": "#ea580c",
     "random": "#b91c1c",
     "exact_prefix": "#047857",
@@ -24,11 +36,23 @@ POLICY_PALETTE = {
 }
 POLICY_LINESTYLES = {
     "summary": "-",
+    "vllm_prefix_mock": (0, (6, 2)),
+    "vllm_kv_mock": (0, (3, 2)),
     "load_only": "-.",
     "random": ":",
     "exact_prefix": "--",
     "oracle": (0, (5, 2)),
 }
+
+CORE_RESEARCH_PLOTS = (
+    "ttft_cdf.png",
+    "latency_cdf.png",
+    "ttft_by_policy.png",
+    "latency_by_policy.png",
+    "reuse_latency_tradeoff.png",
+    "latency_by_traffic.png",
+    "reuse_by_traffic.png",
+)
 
 
 def generate_run_plots(run_dir: str | Path, recursive: bool = True) -> list[Path]:
@@ -90,6 +114,7 @@ def _generate_single_run_plots(run_dir: Path) -> list[Path]:
     dataframe = _prepare_dataframe(dataframe)
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
+    _clear_existing_plots(plots_dir)
     created: list[Path] = []
 
     aggregate_mode = bool(summary_runs)
@@ -137,40 +162,6 @@ def _generate_single_run_plots(run_dir: Path) -> list[Path]:
             x_label="Latency (s)",
         )
     )
-    if "reuse_fraction" in dataframe.columns:
-        created.append(
-            _save_box_plot(
-                dataframe,
-                x_field="policy",
-                y_field="reuse_fraction",
-                output_path=plots_dir / "reuse_by_policy.png",
-                title="Reuse Fraction by Policy",
-                x_label="Policy",
-                y_label="Reuse fraction",
-            )
-        )
-        created.append(
-            _save_histogram_plot(
-                dataframe,
-                x_field="reuse_fraction",
-                output_path=plots_dir / "reuse_fraction_distribution.png",
-                title="Reuse Fraction Distribution",
-                x_label="Reuse fraction",
-            )
-        )
-    if {"predicted_latency", "actual_latency"}.issubset(dataframe.columns):
-        created.append(
-            _save_scatter_plot(
-                dataframe,
-                x_field="predicted_latency",
-                y_field="actual_latency",
-                output_path=plots_dir / "predicted_vs_actual_latency.png",
-                title="Predicted vs Observed Latency",
-                x_label="Predicted latency (s)",
-                y_label="Observed latency (s)",
-            )
-        )
-
     created.append(
         _save_tradeoff_plot(
             dataframe,
@@ -179,22 +170,6 @@ def _generate_single_run_plots(run_dir: Path) -> list[Path]:
             title="Reuse vs Median Latency",
         )
     )
-    if "cluster_id" in dataframe.columns:
-        created.append(
-            _save_cluster_mix_plot(
-                dataframe,
-                output_path=plots_dir / "cluster_assignment.png",
-                title="Cluster Assignment Mix by Policy",
-            )
-        )
-    if "had_failover" in dataframe.columns:
-        created.append(
-            _save_failover_rate_plot(
-                dataframe,
-                output_path=plots_dir / "failover_distribution.png",
-                title="Failover Rate by Policy",
-            )
-        )
     if traffic_rows:
         created.append(
             _save_traffic_point_plot(
@@ -255,6 +230,7 @@ def _generate_summary_only_plots(
     summary_frame = _prepare_dataframe(pd.DataFrame.from_records(summary_runs))
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
+    _clear_existing_plots(plots_dir)
     created: list[Path] = []
     created.append(
         _save_policy_interval_plot(
@@ -309,6 +285,11 @@ def _generate_summary_only_plots(
         )
     plt.close("all")
     return [path for path in created if path.exists()]
+
+
+def _clear_existing_plots(plots_dir: Path) -> None:
+    for path in plots_dir.glob("*.png"):
+        path.unlink()
 
 
 def _prepare_dataframe(dataframe):

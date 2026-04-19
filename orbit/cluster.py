@@ -15,8 +15,8 @@ from .trie import PrefixTrie
 class ClusterConfig:
     cache_capacity: int = 256
     cache_capacity_tokens: int | None = None
-    summary_depths: tuple[int, ...] = (64, 128, 256, 512)
-    bloom_bits: int = 8192
+    summary_depths: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512)
+    bloom_bits: int = 16384
     bloom_hashes: int = 5
     summary_interval: float = 5.0
     concurrency: int = 1

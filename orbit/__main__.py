@@ -4,7 +4,11 @@ import argparse
 import json
 from dataclasses import asdict, replace
 
-from .benchmark import prediction_error_summary, replay_policy, split_workload
+from .benchmark import (
+    resolve_reachable_clusters_per_router,
+    select_config_by_validation,
+    split_workload,
+)
 from .calibration import fit_router_config
 from .cluster import ClusterConfig
 from .llamacpp import LlamaCppClusterConfig
@@ -17,9 +21,13 @@ from .workload import WorkloadConfig, generate_workload
 def main() -> None:
     parser = argparse.ArgumentParser(description="Orbit cluster-level routing simulator")
     parser.add_argument("--backend", choices=("synthetic", "llama_cpp"), default="synthetic")
+    parser.add_argument("--control-plane-mode", choices=("inprocess", "multiprocess"), default="inprocess")
+    parser.add_argument("--control-plane-start-method", default="spawn")
     parser.add_argument("--policy", default="summary", help="policy to run")
     parser.add_argument("--compare", action="store_true", help="run all built-in policies")
     parser.add_argument("--requests", type=int, default=200, help="number of requests")
+    parser.add_argument("--topology-mode", choices=("all_to_all", "sparse_overlap"), default="all_to_all")
+    parser.add_argument("--reachable-clusters-per-router", type=int)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--cache-token-capacity", type=int)
     parser.add_argument("--workload-kind", choices=("synthetic", "mixed_realistic"), default="synthetic")
@@ -66,6 +74,7 @@ def main() -> None:
     parser.add_argument("--failure-start", type=float, default=0.0, help="start time of the injected cluster outage window")
     parser.add_argument("--failure-duration", type=float, default=0.0, help="duration of the injected cluster outage window")
     parser.add_argument("--retry-penalty", type=float, default=0.0, help="additional delay before rerouting after an injected cluster failure")
+    parser.add_argument("--validation-p95-regression-tolerance", type=float, default=0.05)
     parser.add_argument("--llama-extra-arg", action="append", default=[], help="extra argument forwarded to llama-server")
     args = parser.parse_args()
 
@@ -81,6 +90,10 @@ def main() -> None:
         parser.error("--calibrate-router requires --warmup-requests to be greater than zero")
     if args.live_arrival_scale is not None and args.live_arrival_scale <= 0:
         parser.error("--live-arrival-scale must be positive")
+    if args.reachable_clusters_per_router is not None and args.reachable_clusters_per_router <= 0:
+        parser.error("--reachable-clusters-per-router must be positive")
+    if args.validation_p95_regression_tolerance < 0:
+        parser.error("--validation-p95-regression-tolerance must be non-negative")
     for probability in (args.summary_drop_probability, args.gossip_drop_probability):
         if not 0.0 <= probability <= 1.0:
             parser.error("drop probabilities must be between 0 and 1")
@@ -95,8 +108,12 @@ def main() -> None:
 
     config = SimulationConfig(
         backend=args.backend,
+        control_plane_mode=args.control_plane_mode,
+        control_plane_start_method=args.control_plane_start_method,
         router_ids=router_ids,
         cluster_ids=cluster_ids,
+        topology_mode=args.topology_mode,
+        reachable_clusters_per_router=resolve_reachable_clusters_per_router(args),
         cluster_config=ClusterConfig(
             cache_capacity=args.cache_capacity,
             cache_capacity_tokens=cache_token_capacity,
@@ -179,6 +196,7 @@ def main() -> None:
             calibration_records,
             config.router_config,
             source_policy=args.calibration_policy,
+            cluster_specific=True,
         )
         calibrated_config = replace(config, router_config=calibrated_router_config)
         calibration_payload = asdict(calibration)
@@ -186,18 +204,14 @@ def main() -> None:
     selected_config = calibrated_config
     selection_payload: dict[str, object] | None = None
     if validation_requests:
-        base_validation_records = replay_policy(config, args.calibration_policy, warmup_requests, validation_requests)
-        calibrated_validation_records = replay_policy(calibrated_config, args.calibration_policy, warmup_requests, validation_requests)
-        base_validation_error = prediction_error_summary(base_validation_records)
-        calibrated_validation_error = prediction_error_summary(calibrated_validation_records)
-        use_calibrated = calibrated_validation_error["mae"] < base_validation_error["mae"]
-        selected_config = calibrated_config if use_calibrated else config
-        selection_payload = {
-            "selected_config": "calibrated" if use_calibrated else "base",
-            "selection_metric": "validation_prediction_mae",
-            "base_validation_error": base_validation_error,
-            "calibrated_validation_error": calibrated_validation_error,
-        }
+        selected_config, selection_payload = select_config_by_validation(
+            base_config=config,
+            calibrated_config=calibrated_config,
+            calibration_policy=args.calibration_policy,
+            warmup_requests=warmup_requests,
+            validation_requests=validation_requests,
+            p95_regression_tolerance=args.validation_p95_regression_tolerance,
+        )
 
     policy_names = tuple(POLICIES) if args.compare else (args.policy,)
     results: dict[str, dict[str, object]] = {}

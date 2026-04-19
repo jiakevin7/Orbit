@@ -18,27 +18,30 @@ The framework now supports:
 - multi-seed benchmark runs with aggregate summaries
 - grouped reporting by traffic class and dataset/source, with bootstrap confidence intervals on aggregate metrics
 - injected control-plane delay, dropped updates, and cluster outages for robustness testing
+- optional multiprocess control-plane execution, with routers and synthetic or live clusters running as separate worker processes
+- cluster-specific router calibration with validation-time shadow and canary selection under p95 guardrails
+- a standard external benchmark matrix with scenario manifests and root-level matrix summaries
 - live `llama.cpp` execution for TTFT and service-time measurement
 - an opt-in live `llama.cpp` integration test that checks held-out selection, artifact export, and failover under a real cluster outage
 - GitHub Actions coverage for unit tests plus a dedicated self-hosted live `llama.cpp` workflow
 
 ## Next Up
 
-1. Separate the control plane from the benchmark driver.
-   - Move routers and clusters into independent processes.
-   - Add update jitter, delayed gossip, and dropped summary updates.
+1. Make the process-separated control plane harsher and more realistic.
+   - Add transport-level jitter, restarts, and partitions between workers rather than only logical delivery delay.
+   - Measure router/cluster worker recovery after process death.
 
-2. Add live integration tests.
-   - Make the self-hosted live workflow a required pre-merge check where appropriate.
+2. Make the live workflow a stronger gate.
+   - Promote the self-hosted `llama.cpp` workflow to a required pre-merge check where appropriate.
    - Extend it to validate TTFT scale and multi-policy live comparisons end to end.
 
 3. Replace slot polling with richer backend telemetry when available.
    - Prefer task queue depth or scheduler occupancy over busy-slot counts alone.
    - Capture cancellation, timeout, and retry behavior in the live benchmark path.
 
-4. Make router calibration cluster-specific and online.
-   - Fit separate latency surfaces per cluster or region instead of one shared set of coefficients.
-   - Refresh the fitted model continuously from recent traces rather than only from a warm-up slice.
+4. Make router calibration online instead of warm-up only.
+   - Refresh per-cluster latency surfaces continuously from recent traces.
+   - Add longer-horizon rollback logic based on live canary windows, not only held-out replay.
 
 5. Add stronger fault models and recovery metrics.
    - Inject jittery clocks, router restarts, partial network partitions, and summary corruption.

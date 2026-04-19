@@ -13,7 +13,9 @@ from orbit.png_plots import generate_run_plots, plotting_available
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate seaborn PNG plots for an Orbit benchmark run")
+    parser = argparse.ArgumentParser(
+        description="Generate the curated research PNG plot set for an Orbit benchmark run"
+    )
     parser.add_argument("run_dir", help="benchmark output directory")
     parser.add_argument(
         "--no-recursive",

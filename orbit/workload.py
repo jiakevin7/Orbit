@@ -48,8 +48,9 @@ class WorkloadConfig:
     traffic_mix_agent: float = 0.20
     traffic_mix_bursty: float = 0.20
     session_affinity_probability: float = 0.85
-    burst_size_choices: tuple[int, ...] = (2, 3, 4)
+    burst_size_choices: tuple[int, ...] = (2, 3)
     burst_interarrival_ratio: float = 0.05
+    traffic_burst_probability: float = 0.15
     dataset_continuation_floor: int = 8
     dataset_continuation_cap: int = 96
 
@@ -322,6 +323,17 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
             )
             requests.append(request_obj)
             request_index += 1
+            burst_requests = _build_followup_burst_requests(
+                base_request=request_obj,
+                config=config,
+                rng=rng,
+                request_index_start=request_index,
+                max_requests=max(0, remaining - reserve_for_required - 1),
+            )
+            requests.extend(burst_requests)
+            request_index += len(burst_requests)
+            if burst_requests:
+                arrival_time = burst_requests[-1].arrival_time
             continue
 
         if traffic_type == RAG_TRAFFIC_CLASS:
@@ -335,6 +347,17 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
             )
             requests.append(request_obj)
             request_index += 1
+            burst_requests = _build_followup_burst_requests(
+                base_request=request_obj,
+                config=config,
+                rng=rng,
+                request_index_start=request_index,
+                max_requests=max(0, remaining - reserve_for_required - 1),
+            )
+            requests.extend(burst_requests)
+            request_index += len(burst_requests)
+            if burst_requests:
+                arrival_time = burst_requests[-1].arrival_time
             continue
 
         if traffic_type == AGENT_TRAFFIC_CLASS:
@@ -349,6 +372,17 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
             )
             requests.append(request_obj)
             request_index += 1
+            burst_requests = _build_followup_burst_requests(
+                base_request=request_obj,
+                config=config,
+                rng=rng,
+                request_index_start=request_index,
+                max_requests=max(0, remaining - reserve_for_required - 1),
+            )
+            requests.extend(burst_requests)
+            request_index += len(burst_requests)
+            if burst_requests:
+                arrival_time = burst_requests[-1].arrival_time
             continue
 
         burst_requests = _build_bursty_requests(
@@ -638,6 +672,46 @@ def _build_bursty_requests(
         current_arrival += max(
             0.01,
             config.mean_interarrival * config.burst_interarrival_ratio * rng.uniform(0.25, 1.25),
+        )
+    return requests
+
+
+def _build_followup_burst_requests(
+    *,
+    base_request: Request,
+    config: WorkloadConfig,
+    rng: random.Random,
+    request_index_start: int,
+    max_requests: int,
+) -> list[Request]:
+    if max_requests <= 0 or config.traffic_burst_probability <= 0:
+        return []
+    if rng.random() >= config.traffic_burst_probability:
+        return []
+
+    burst_size = min(rng.choice(config.burst_size_choices), max_requests + 1)
+    if burst_size <= 1:
+        return []
+
+    requests: list[Request] = []
+    current_arrival = base_request.arrival_time
+    for offset in range(1, burst_size):
+        current_arrival += max(
+            0.01,
+            config.mean_interarrival * config.burst_interarrival_ratio * rng.uniform(0.25, 1.25),
+        )
+        requests.append(
+            Request(
+                request_id=f"req-{request_index_start + offset - 1:05d}",
+                arrival_time=current_arrival,
+                router_id=base_request.router_id,
+                prefix_tokens=base_request.prefix_tokens,
+                continuation_tokens=base_request.continuation_tokens,
+                prompt_prefix_text=base_request.prompt_prefix_text,
+                traffic_class=base_request.traffic_class,
+                session_id=base_request.session_id,
+                source_id=base_request.source_id,
+            )
         )
     return requests
 
