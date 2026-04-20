@@ -30,6 +30,7 @@ class LlamaCppClusterConfig:
     parallel: int = 1
     request_timeout: float = 120.0
     startup_timeout: float = 120.0
+    prompt_token_cap: int | None = None
     temperature: float = 0.0
     top_p: float = 1.0
     seed: int = 0
@@ -47,6 +48,7 @@ class LlamaCppClusterConfig:
             parallel=self.parallel,
             request_timeout=self.request_timeout,
             startup_timeout=self.startup_timeout,
+            prompt_token_cap=self.prompt_token_cap,
             temperature=self.temperature,
             top_p=self.top_p,
             seed=self.seed,
@@ -393,17 +395,56 @@ class LlamaCppCluster:
         self._ensure_started()
         prepared: list[Request] = []
         for request_obj in requests:
-            if request_obj.prefix_token_source == "llama_cpp":
-                prepared.append(request_obj)
-                continue
-            prepared.append(
-                replace(
-                    request_obj,
-                    prefix_tokens=self._client.tokenize(request_obj.prompt_text),
-                    prefix_token_source="llama_cpp",
-                )
-            )
+            prepared.append(self._prepare_request(request_obj))
         return prepared
+
+    def _prepare_request(self, request_obj: Request) -> Request:
+        prompt_prefix_text = request_obj.prompt_prefix_text or request_obj.prompt_text
+        budget = self._prompt_token_budget(request_obj.continuation_tokens)
+        tokens = self._client.tokenize(_prompt_text_from_prefix(prompt_prefix_text))
+        if budget is not None and len(tokens) > budget:
+            prompt_prefix_text = self._truncate_prompt_prefix_to_budget(
+                prompt_prefix_text,
+                token_budget=budget,
+            )
+            tokens = self._client.tokenize(_prompt_text_from_prefix(prompt_prefix_text))
+        return replace(
+            request_obj,
+            prompt_prefix_text=prompt_prefix_text,
+            prefix_tokens=tokens,
+            prefix_token_source="llama_cpp",
+        )
+
+    def _prompt_token_budget(self, continuation_tokens: int) -> int | None:
+        configured_cap = self.backend_config.prompt_token_cap
+        hard_cap = max(1, self.backend_config.ctx_size - max(continuation_tokens, 1))
+        if configured_cap is None:
+            return hard_cap
+        return max(1, min(configured_cap, hard_cap))
+
+    def _truncate_prompt_prefix_to_budget(
+        self,
+        prompt_prefix_text: str,
+        *,
+        token_budget: int,
+    ) -> str:
+        normalized = prompt_prefix_text.rstrip()
+        if not normalized:
+            return normalized
+
+        low = 0
+        high = len(normalized)
+        best = ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = normalized[:mid].rstrip()
+            candidate_tokens = self._client.tokenize(_prompt_text_from_prefix(candidate))
+            if len(candidate_tokens) <= token_budget:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
 
     def queue_depth(self, now: float) -> int:
         del now
@@ -616,3 +657,10 @@ class LlamaCppCluster:
     def _remove_cached_tokens(self, tokens: tuple[int, ...]) -> None:
         self.trie.remove(tokens)
         self._cached_token_total -= len(tokens)
+
+
+def _prompt_text_from_prefix(prompt_prefix_text: str) -> str:
+    normalized = prompt_prefix_text.rstrip()
+    if normalized.endswith("Assistant:"):
+        return normalized
+    return f"{normalized}\nAssistant:"

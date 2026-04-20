@@ -58,10 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sharegpt-sample-limit", type=int, default=2000)
     parser.add_argument("--rag-sample-limit", type=int, default=2000)
     parser.add_argument("--agent-sample-limit", type=int, default=2000)
-    parser.add_argument("--traffic-mix-chat", type=float, default=0.35)
-    parser.add_argument("--traffic-mix-rag", type=float, default=0.25)
-    parser.add_argument("--traffic-mix-agent", type=float, default=0.20)
-    parser.add_argument("--traffic-mix-bursty", type=float, default=0.20)
+    parser.add_argument("--traffic-mix-chat", type=float, default=0.4375)
+    parser.add_argument("--traffic-mix-rag", type=float, default=0.3125)
+    parser.add_argument("--traffic-mix-agent", type=float, default=0.25)
+    parser.add_argument("--traffic-mix-bursty", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--arrival-scale",

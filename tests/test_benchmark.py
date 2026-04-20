@@ -8,6 +8,7 @@ from orbit.benchmark import (
     aggregate_summary_rows,
     build_simulation_config,
     flatten_metrics_row,
+    resolve_prompt_prefix_token_cap,
     resolve_reachable_clusters_per_router,
     validation_candidate_accepted,
     validation_metrics_summary,
@@ -108,6 +109,21 @@ class BenchmarkTests(unittest.TestCase):
             clusters=6,
         )
         self.assertIsNone(resolve_reachable_clusters_per_router(args))
+
+    def test_resolve_prompt_prefix_token_cap_reserves_llama_context_headroom(self) -> None:
+        args = argparse.Namespace(
+            backend="llama_cpp",
+            llama_ctx_size=4096,
+            continuation_token_cap=96,
+        )
+        self.assertEqual(resolve_prompt_prefix_token_cap(args), 3584)
+
+        args = argparse.Namespace(
+            backend="synthetic",
+            llama_ctx_size=4096,
+            continuation_token_cap=96,
+        )
+        self.assertEqual(resolve_prompt_prefix_token_cap(args), 4096)
 
     def test_build_simulation_config_records_sparse_topology(self) -> None:
         args = argparse.Namespace(

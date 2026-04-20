@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional cap applied to generated continuation token budgets",
     )
     parser.add_argument(
+        "--prompt-prefix-token-cap",
+        type=int,
+        help="optional cap applied to generated prompt prefixes before backend tokenization",
+    )
+    parser.add_argument(
         "--cache-capacity",
         type=int,
         default=256,
@@ -101,10 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rag-sample-limit", type=int, default=2000, help="maximum number of external RAG examples to load")
     parser.add_argument("--agent-sample-limit", type=int, default=2000, help="maximum number of external agent examples to load")
-    parser.add_argument("--traffic-mix-chat", type=float, default=0.35, help="weight for ShareGPT-style chat traffic")
-    parser.add_argument("--traffic-mix-rag", type=float, default=0.25, help="weight for RAG traffic")
-    parser.add_argument("--traffic-mix-agent", type=float, default=0.20, help="weight for agent/tool traffic")
-    parser.add_argument("--traffic-mix-bursty", type=float, default=0.20, help="weight for bursty session traffic")
+    parser.add_argument("--traffic-mix-chat", type=float, default=0.4375, help="weight for ShareGPT-style chat traffic")
+    parser.add_argument("--traffic-mix-rag", type=float, default=0.3125, help="weight for RAG traffic")
+    parser.add_argument("--traffic-mix-agent", type=float, default=0.25, help="weight for agent/tool traffic")
+    parser.add_argument("--traffic-mix-bursty", type=float, default=0.0, help="weight for bursty session traffic")
     parser.add_argument(
         "--warmup-requests",
         type=int,
@@ -245,7 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "control_plane_mode": args.control_plane_mode,
         "control_plane_start_method": args.control_plane_start_method,
-        "calibration_scope": "per_cluster_shadow_canary" if args.calibrate_router else "disabled",
+        "calibration_scope": "global" if args.calibrate_router else "disabled",
         "validation_p95_regression_tolerance": args.validation_p95_regression_tolerance,
         "prefix_token_source": "llama_cpp" if args.backend == "llama_cpp" else "synthetic_lexical",
         "live_arrival_scale": resolve_live_arrival_scale(args),
@@ -253,11 +258,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json(output_dir / "manifest.json", manifest)
 
     metrics_by_seed: dict[int, dict[str, object]] = {}
-    calibration_by_seed: dict[int, dict[str, object]] = {}
-    selection_by_seed: dict[int, dict[str, object]] = {}
     summary_run_rows: list[dict[str, object]] = []
     traffic_run_rows: list[dict[str, object]] = []
     source_run_rows: list[dict[str, object]] = []
+    seed_runs: list[dict[str, object]] = []
 
     for seed in seeds:
         config = build_simulation_config(args, seed=seed)
@@ -291,56 +295,120 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_json(run_dir / "measured_workload.json", requests_as_dicts(test_requests))
         write_json(run_dir / "test_workload.json", requests_as_dicts(test_requests))
 
-        calibrated_config = config
-        calibration_payload: dict[str, object] | None = None
-        if args.calibrate_router:
-            calibration_simulation = Simulation(allocate_config(config))
+        seed_runs.append(
+            {
+                "seed": seed,
+                "config": config,
+                "allocate_config": allocate_config,
+                "run_dir": run_dir,
+                "warmup_requests": warmup_requests,
+                "validation_requests": validation_requests,
+                "test_requests": test_requests,
+            }
+        )
+
+    calibrated_router_config = seed_runs[0]["config"].router_config if seed_runs else RouterConfig()
+    calibration_payload: dict[str, object] | None = None
+    if args.calibrate_router:
+        calibration_records: list = []
+        calibration_records_by_seed: dict[str, int] = {}
+        for seed_run in seed_runs:
+            warmup_requests = seed_run["warmup_requests"]
+            if not warmup_requests:
+                continue
+            calibration_simulation = Simulation(seed_run["allocate_config"](seed_run["config"]))
             try:
-                calibration_records, _ = calibration_simulation.run(
+                records, _ = calibration_simulation.run(
                     policy_name=args.calibration_policy,
                     requests=warmup_requests,
                     close_on_finish=True,
                 )
             finally:
                 calibration_simulation.close()
-            calibrated_router_config, calibration = fit_router_config(
-                calibration_records,
-                config.router_config,
-                source_policy=args.calibration_policy,
-                cluster_specific=True,
-            )
-            calibrated_config = replace(config, router_config=calibrated_router_config)
-            calibration_payload = asdict(calibration)
-            calibration_by_seed[seed] = calibration_payload
-            write_json(run_dir / "calibration.json", calibration_payload)
+            calibration_records.extend(records)
+            calibration_records_by_seed[str(seed_run["seed"])] = len(records)
+        calibrated_router_config, calibration = fit_router_config(
+            calibration_records,
+            seed_runs[0]["config"].router_config,
+            source_policy=args.calibration_policy,
+        )
+        calibration_payload = asdict(calibration)
+        calibration_payload["evaluation_seeds"] = list(seeds)
+        calibration_payload["records_by_seed"] = calibration_records_by_seed
+        write_json(output_dir / "calibration.json", calibration_payload)
 
-        selected_config = calibrated_config
-        selection_payload: dict[str, object] | None = None
-        if validation_requests:
-            selected_config, selection_payload = select_config_by_validation(
-                base_config=config,
-                calibrated_config=calibrated_config,
-                calibration_policy=args.calibration_policy,
-                warmup_requests=warmup_requests,
-                validation_requests=validation_requests,
-                p95_regression_tolerance=args.validation_p95_regression_tolerance,
-                config_allocator=allocate_config,
+    selected_router_config = calibrated_router_config
+    selection_payload: dict[str, object] | None = None
+    if any(seed_run["validation_requests"] for seed_run in seed_runs):
+        base_validation_records: list = []
+        calibrated_validation_records: list = []
+        validation_records_by_seed: dict[str, dict[str, int]] = {}
+        for seed_run in seed_runs:
+            validation_requests = seed_run["validation_requests"]
+            if not validation_requests:
+                continue
+            base_records = replay_policy(
+                seed_run["config"],
+                args.calibration_policy,
+                seed_run["warmup_requests"],
+                validation_requests,
+                config_allocator=seed_run["allocate_config"],
             )
-            selection_by_seed[seed] = selection_payload
-            write_json(run_dir / "selection.json", selection_payload)
+            calibrated_records = replay_policy(
+                replace(seed_run["config"], router_config=calibrated_router_config),
+                args.calibration_policy,
+                seed_run["warmup_requests"],
+                validation_requests,
+                config_allocator=seed_run["allocate_config"],
+            )
+            base_validation_records.extend(base_records)
+            calibrated_validation_records.extend(calibrated_records)
+            validation_records_by_seed[str(seed_run["seed"])] = {
+                "base": len(base_records),
+                "calibrated": len(calibrated_records),
+            }
+        base_validation_error = prediction_error_summary(base_validation_records)
+        base_validation_metrics = validation_metrics_summary(base_validation_records)
+        calibrated_validation_error = prediction_error_summary(calibrated_validation_records)
+        calibrated_validation_metrics = validation_metrics_summary(calibrated_validation_records)
+        accepted, reasons = validation_candidate_accepted(
+            base_validation_error,
+            base_validation_metrics,
+            calibrated_validation_error,
+            calibrated_validation_metrics,
+            args.validation_p95_regression_tolerance,
+        )
+        selection_payload = {
+            "selected_config": "calibrated" if accepted else "base",
+            "selection_metric": "validation_prediction_mae_with_p95_guardrail",
+            "p95_regression_tolerance": args.validation_p95_regression_tolerance,
+            "evaluation_seeds": list(seeds),
+            "records_by_seed": validation_records_by_seed,
+            "base_validation_error": base_validation_error,
+            "base_validation_metrics": base_validation_metrics,
+            "calibrated_validation_error": calibrated_validation_error,
+            "calibrated_validation_metrics": calibrated_validation_metrics,
+            "calibrated_rejection_reasons": reasons,
+        }
+        if not accepted:
+            selected_router_config = seed_runs[0]["config"].router_config
+        write_json(output_dir / "selection.json", selection_payload)
 
+    for seed_run in seed_runs:
+        seed = seed_run["seed"]
+        selected_config = replace(seed_run["config"], router_config=selected_router_config)
         metrics_by_policy = {}
         for policy_name in policies:
-            simulation = Simulation(allocate_config(selected_config))
-            if warmup_requests:
+            simulation = Simulation(seed_run["allocate_config"](selected_config))
+            if seed_run["warmup_requests"]:
                 simulation.run(
                     policy_name=policy_name,
-                    requests=warmup_requests,
+                    requests=seed_run["warmup_requests"],
                     close_on_finish=False,
                 )
             records, metrics = simulation.run(
                 policy_name=policy_name,
-                requests=test_requests,
+                requests=seed_run["test_requests"],
                 close_on_finish=True,
             )
             metrics_by_policy[policy_name] = metrics
@@ -356,19 +424,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if args.record_format in ("json", "both"):
                 write_json(
-                    run_dir / f"{policy_name}_records.json",
+                    seed_run["run_dir"] / f"{policy_name}_records.json",
                     execution_records_as_dicts(records),
                 )
             if args.record_format in ("csv", "both"):
-                write_execution_records_csv(run_dir / f"{policy_name}_records.csv", records)
+                write_execution_records_csv(seed_run["run_dir"] / f"{policy_name}_records.csv", records)
 
         write_json(
-            run_dir / "summary.json",
+            seed_run["run_dir"] / "summary.json",
             {policy_name: metrics_as_dict(metrics) for policy_name, metrics in metrics_by_policy.items()},
         )
-        write_rows_csv(run_dir / "summary.csv", metrics_rows_by_policy(metrics_by_policy))
+        write_rows_csv(seed_run["run_dir"] / "summary.csv", metrics_rows_by_policy(metrics_by_policy))
         write_rows_csv(
-            run_dir / "summary_by_traffic.csv",
+            seed_run["run_dir"] / "summary_by_traffic.csv",
             [
                 row
                 for row in traffic_run_rows
@@ -376,7 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ],
         )
         write_rows_csv(
-            run_dir / "summary_by_source.csv",
+            seed_run["run_dir"] / "summary_by_source.csv",
             [
                 row
                 for row in source_run_rows
@@ -404,10 +472,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir / "summary_by_source_aggregate.csv",
             aggregate_summary_rows(source_run_rows, group_keys=("policy", "source_id")),
         )
-        if calibration_by_seed:
-            write_json(output_dir / "calibration_runs.json", calibration_by_seed)
-        if selection_by_seed:
-            write_json(output_dir / "selection_runs.json", selection_by_seed)
 
     print(f"wrote benchmark artifacts to {output_dir}")
     if len(seeds) == 1:
@@ -460,6 +524,7 @@ def build_simulation_config(args: argparse.Namespace, seed: int | None = None) -
                 parallel=args.llama_parallel,
                 request_timeout=args.llama_timeout,
                 startup_timeout=args.llama_startup_timeout,
+                prompt_token_cap=resolve_prompt_prefix_token_cap(args),
                 extra_args=tuple(args.llama_extra_arg),
             )
             if args.backend == "llama_cpp"
@@ -494,6 +559,7 @@ def build_simulation_config(args: argparse.Namespace, seed: int | None = None) -
             traffic_mix_bursty=args.traffic_mix_bursty,
             dataset_continuation_floor=_continuation_floor(args.continuation_token_cap),
             dataset_continuation_cap=_continuation_cap(args.continuation_token_cap),
+            prompt_prefix_token_cap=resolve_prompt_prefix_token_cap(args),
             seed=args.seed if seed is None else seed,
         ),
     )
@@ -513,6 +579,17 @@ def resolve_cache_token_capacity(args: argparse.Namespace) -> int | None:
     if args.workload_kind == "mixed_realistic":
         return 4096
     return None
+
+
+def resolve_prompt_prefix_token_cap(args: argparse.Namespace) -> int | None:
+    explicit_cap = getattr(args, "prompt_prefix_token_cap", None)
+    if explicit_cap is not None:
+        return explicit_cap
+    if args.backend != "llama_cpp":
+        return WorkloadConfig.prompt_prefix_token_cap
+    continuation_cap = _continuation_cap(args.continuation_token_cap)
+    reserved_tokens = max(512, continuation_cap + 128)
+    return max(256, args.llama_ctx_size - reserved_tokens)
 
 
 def resolve_reachable_clusters_per_router(args: argparse.Namespace) -> int | None:
@@ -678,100 +755,28 @@ def select_config_by_validation(
         "base_validation_metrics": base_validation_metrics,
     }
 
-    cluster_overrides = dict(calibrated_config.router_config.cluster_overrides)
-    if not cluster_overrides:
-        calibrated_records = replay_policy(
-            calibrated_config,
-            calibration_policy,
-            warmup_requests,
-            validation_requests,
-            config_allocator=config_allocator,
-        )
-        calibrated_validation_error = prediction_error_summary(calibrated_records)
-        calibrated_validation_metrics = validation_metrics_summary(calibrated_records)
-        accepted, reasons = validation_candidate_accepted(
-            base_validation_error,
-            base_validation_metrics,
-            calibrated_validation_error,
-            calibrated_validation_metrics,
-            p95_regression_tolerance,
-        )
-        payload["calibrated_validation_error"] = calibrated_validation_error
-        payload["calibrated_validation_metrics"] = calibrated_validation_metrics
-        payload["calibrated_rejection_reasons"] = reasons
-        if accepted:
-            payload["selected_config"] = "calibrated"
-            return calibrated_config, payload
-        return base_config, payload
-
-    cluster_shadow_results: dict[str, object] = {}
-    accepted_cluster_overrides: dict[str, dict[str, float]] = {}
-    for cluster_id, override in sorted(cluster_overrides.items()):
-        cluster_candidate = replace(
-            base_config,
-            router_config=replace(base_config.router_config, cluster_overrides={cluster_id: override}),
-        )
-        cluster_records = replay_policy(
-            cluster_candidate,
-            calibration_policy,
-            warmup_requests,
-            validation_requests,
-            config_allocator=config_allocator,
-        )
-        cluster_error = prediction_error_summary(cluster_records)
-        cluster_metrics = validation_metrics_summary(cluster_records)
-        accepted, reasons = validation_candidate_accepted(
-            base_validation_error,
-            base_validation_metrics,
-            cluster_error,
-            cluster_metrics,
-            p95_regression_tolerance,
-        )
-        cluster_shadow_results[cluster_id] = {
-            "accepted": accepted,
-            "validation_error": cluster_error,
-            "validation_metrics": cluster_metrics,
-            "rejection_reasons": reasons,
-        }
-        if accepted:
-            accepted_cluster_overrides[cluster_id] = override
-
-    payload["cluster_shadow_results"] = cluster_shadow_results
-    payload["accepted_clusters"] = sorted(accepted_cluster_overrides)
-    payload["rejected_clusters"] = sorted(cluster_id for cluster_id in cluster_overrides if cluster_id not in accepted_cluster_overrides)
-
-    if not accepted_cluster_overrides:
-        payload["canary_validation_error"] = base_validation_error
-        payload["canary_validation_metrics"] = base_validation_metrics
-        payload["canary_rejection_reasons"] = ["no_cluster_overrides_passed"]
-        return base_config, payload
-
-    canary_config = replace(
-        base_config,
-        router_config=replace(base_config.router_config, cluster_overrides=accepted_cluster_overrides),
-    )
-    canary_records = replay_policy(
-        canary_config,
+    calibrated_records = replay_policy(
+        calibrated_config,
         calibration_policy,
         warmup_requests,
         validation_requests,
         config_allocator=config_allocator,
     )
-    canary_validation_error = prediction_error_summary(canary_records)
-    canary_validation_metrics = validation_metrics_summary(canary_records)
+    calibrated_validation_error = prediction_error_summary(calibrated_records)
+    calibrated_validation_metrics = validation_metrics_summary(calibrated_records)
     accepted, reasons = validation_candidate_accepted(
         base_validation_error,
         base_validation_metrics,
-        canary_validation_error,
-        canary_validation_metrics,
+        calibrated_validation_error,
+        calibrated_validation_metrics,
         p95_regression_tolerance,
     )
-    payload["canary_validation_error"] = canary_validation_error
-    payload["canary_validation_metrics"] = canary_validation_metrics
-    payload["canary_rejection_reasons"] = reasons
+    payload["calibrated_validation_error"] = calibrated_validation_error
+    payload["calibrated_validation_metrics"] = calibrated_validation_metrics
+    payload["calibrated_rejection_reasons"] = reasons
     if accepted:
-        payload["selected_config"] = "canary"
-        return canary_config, payload
+        payload["selected_config"] = "calibrated"
+        return calibrated_config, payload
     return base_config, payload
 
 

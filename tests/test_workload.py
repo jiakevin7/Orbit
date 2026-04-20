@@ -211,9 +211,94 @@ class WorkloadTests(unittest.TestCase):
         self.assertTrue(rag_requests)
         self.assertTrue(agent_requests)
         self.assertTrue(any(request.source_id == "rag-1" for request in rag_requests))
-        self.assertTrue(any(request.source_id == "agent-1" for request in agent_requests))
+        self.assertTrue(any((request.source_id or "").startswith("agent-1:turn-") for request in agent_requests))
         self.assertTrue(any("doc-a" in (request.prompt_prefix_text or "") for request in rag_requests))
         self.assertTrue(any("lookup_order" in (request.prompt_prefix_text or "") for request in agent_requests))
+
+    def test_followup_bursts_modify_prompt_instead_of_cloning_it(self) -> None:
+        sharegpt_payload = [
+            {
+                "id": "conv-1",
+                "conversations": [
+                    {"from": "human", "value": "Explain why router summaries can drift."},
+                    {"from": "gpt", "value": "They lag real cache state and queue pressure."},
+                    {"from": "human", "value": "What should the operator check first?"},
+                    {"from": "gpt", "value": "Check summary age and whether the cluster is already saturated."},
+                ],
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "sharegpt.json"
+            dataset_path.write_text(json.dumps(sharegpt_payload), encoding="utf-8")
+            requests = generate_workload(
+                WorkloadConfig(
+                    num_requests=4,
+                    workload_kind="mixed_realistic",
+                    sharegpt_path=str(dataset_path),
+                    traffic_mix_chat=1.0,
+                    traffic_mix_rag=0.0,
+                    traffic_mix_agent=0.0,
+                    traffic_mix_bursty=0.0,
+                    traffic_burst_probability=1.0,
+                    burst_size_choices=(2,),
+                    seed=3,
+                )
+            )
+
+        self.assertEqual(len(requests), 4)
+        prompt_texts = [request.prompt_prefix_text for request in requests]
+        self.assertEqual(len(prompt_texts), len(set(prompt_texts)))
+        self.assertTrue(
+            any(
+                "Clarify which assumption" in (prompt or "")
+                or "Rewrite the recommendation" in (prompt or "")
+                or "State one concrete next check" in (prompt or "")
+                for prompt in prompt_texts[1:]
+            )
+        )
+
+    def test_chat_requests_use_unique_turn_units_before_recycling(self) -> None:
+        sharegpt_payload = [
+            {
+                "id": "conv-1",
+                "conversations": [
+                    {"from": "human", "value": "First question?"},
+                    {"from": "gpt", "value": "First answer."},
+                    {"from": "human", "value": "Second question?"},
+                    {"from": "gpt", "value": "Second answer."},
+                ],
+            },
+            {
+                "id": "conv-2",
+                "conversations": [
+                    {"from": "human", "value": "Third question?"},
+                    {"from": "gpt", "value": "Third answer."},
+                    {"from": "human", "value": "Fourth question?"},
+                    {"from": "gpt", "value": "Fourth answer."},
+                ],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "sharegpt.json"
+            dataset_path.write_text(json.dumps(sharegpt_payload), encoding="utf-8")
+            requests = generate_workload(
+                WorkloadConfig(
+                    num_requests=4,
+                    workload_kind="mixed_realistic",
+                    sharegpt_path=str(dataset_path),
+                    traffic_mix_chat=1.0,
+                    traffic_mix_rag=0.0,
+                    traffic_mix_agent=0.0,
+                    traffic_mix_bursty=0.0,
+                    traffic_burst_probability=0.0,
+                    seed=8,
+                )
+            )
+
+        source_ids = [request.source_id for request in requests]
+        self.assertEqual(len(source_ids), len(set(source_ids)))
 
     def test_lmsys_and_financebench_shapes_load_without_manual_rewrite(self) -> None:
         lmsys_payload = [

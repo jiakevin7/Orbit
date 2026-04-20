@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .cluster import Cluster, ClusterConfig
 from .llamacpp import LlamaCppCluster, LlamaCppClusterConfig
 from .models import Request
-from .router import Router, RouterConfig
+from .router import Router, RouterConfig, build_prediction_details, cost_coefficients_for_cluster
 
 
 def _worker_loop(connection: Connection, factory: Callable[[], object]) -> None:
@@ -308,97 +308,19 @@ class ProcessRouterProxy(_ProcessProxy):
         missing_summary: bool = False,
         extra_uncertainty_penalty: float = 0.0,
     ) -> tuple[float, dict[str, float]]:
-        coefficients = self._coefficients_for_cluster(cluster_id)
-        ttft_coefficients = self._ttft_coefficients_for_cluster(cluster_id)
-        remaining_prefill = max(0, request.input_length - estimated_reusable_tokens)
-        queue_delay = raw_queue_depth * coefficients["queue_depth_penalty"]
-        queue_quadratic_delay = (raw_queue_depth ** 2) * coefficients["queue_quadratic_penalty"]
-        queue_prefill_penalty = raw_queue_depth * remaining_prefill * coefficients["queue_prefill_interaction"]
-        stale_penalty = max(0.0, metadata_age) * coefficients["stale_penalty_per_second"]
-        uncertainty_penalty = (
-            uncertainty_gap * coefficients["uncertainty_penalty_per_token"]
-            + extra_uncertainty_penalty
+        details = build_prediction_details(
+            config=self.config,
+            cluster_id=cluster_id,
+            network_cost=self.network_cost(cluster_id),
+            request=request,
+            estimated_reusable_tokens=estimated_reusable_tokens,
+            raw_queue_depth=raw_queue_depth,
+            metadata_age=metadata_age,
+            uncertainty_gap=uncertainty_gap,
+            missing_summary=missing_summary,
+            extra_uncertainty_penalty=extra_uncertainty_penalty,
         )
-        missing_summary_penalty = coefficients["missing_summary_penalty"] if missing_summary else 0.0
-        ttft_queue_delay = raw_queue_depth * ttft_coefficients["ttft_queue_depth_penalty"]
-        ttft_queue_quadratic_delay = (raw_queue_depth ** 2) * ttft_coefficients["ttft_queue_quadratic_penalty"]
-        ttft_queue_prefill_penalty = raw_queue_depth * remaining_prefill * ttft_coefficients["ttft_queue_prefill_interaction"]
-        ttft_stale_penalty = max(0.0, metadata_age) * ttft_coefficients["ttft_stale_penalty_per_second"]
-        ttft_uncertainty_penalty = (
-            uncertainty_gap * ttft_coefficients["ttft_uncertainty_penalty_per_token"]
-            + extra_uncertainty_penalty
-        )
-        ttft_missing_summary_penalty = ttft_coefficients["ttft_missing_summary_penalty"] if missing_summary else 0.0
-        predicted_latency = (
-            self.network_cost(cluster_id)
-            + coefficients["fixed_overhead"]
-            + queue_delay
-            + queue_quadratic_delay
-            + queue_prefill_penalty
-            + remaining_prefill * coefficients["prefill_cost_per_token"]
-            + request.continuation_tokens * coefficients["decode_cost_per_token"]
-            + stale_penalty
-            + uncertainty_penalty
-            + missing_summary_penalty
-        )
-        predicted_ttft = (
-            self.network_cost(cluster_id)
-            + ttft_coefficients["ttft_fixed_overhead"]
-            + ttft_queue_delay
-            + ttft_queue_quadratic_delay
-            + ttft_queue_prefill_penalty
-            + remaining_prefill * ttft_coefficients["ttft_prefill_cost_per_token"]
-            + ttft_stale_penalty
-            + ttft_uncertainty_penalty
-            + ttft_missing_summary_penalty
-        )
-        predicted_route_cost = predicted_ttft + (
-            max(0.0, predicted_latency - predicted_ttft) * self.config.routing_latency_weight
-        )
-        return predicted_latency, {
-            "network_cost": self.network_cost(cluster_id),
-            "queue_delay": queue_delay,
-            "queue_quadratic_delay": queue_quadratic_delay,
-            "queue_prefill_penalty": queue_prefill_penalty,
-            "predicted_latency": predicted_latency,
-            "predicted_ttft": predicted_ttft,
-            "predicted_route_cost": predicted_route_cost,
-            "raw_queue_depth": raw_queue_depth,
-            "estimated_remaining_prefill_tokens": remaining_prefill,
-            "stale_penalty": stale_penalty,
-            "ttft_stale_penalty": ttft_stale_penalty,
-            "metadata_age": max(0.0, metadata_age),
-            "uncertainty_gap": uncertainty_gap,
-            "uncertainty_penalty": uncertainty_penalty,
-            "ttft_uncertainty_penalty": ttft_uncertainty_penalty,
-            "missing_summary": 1.0 if missing_summary else 0.0,
-            "missing_summary_penalty": missing_summary_penalty,
-            "ttft_missing_summary_penalty": ttft_missing_summary_penalty,
-        }
+        return float(details["predicted_latency"]), details
 
     def _coefficients_for_cluster(self, cluster_id: str) -> dict[str, float]:
-        overrides = self.config.cluster_overrides.get(cluster_id, {})
-        return {
-            "fixed_overhead": float(overrides.get("fixed_overhead", self.config.fixed_overhead)),
-            "prefill_cost_per_token": float(overrides.get("prefill_cost_per_token", self.config.prefill_cost_per_token)),
-            "decode_cost_per_token": float(overrides.get("decode_cost_per_token", self.config.decode_cost_per_token)),
-            "queue_depth_penalty": float(overrides.get("queue_depth_penalty", self.config.queue_depth_penalty)),
-            "queue_quadratic_penalty": float(overrides.get("queue_quadratic_penalty", self.config.queue_quadratic_penalty)),
-            "queue_prefill_interaction": float(overrides.get("queue_prefill_interaction", self.config.queue_prefill_interaction)),
-            "stale_penalty_per_second": float(overrides.get("stale_penalty_per_second", self.config.stale_penalty_per_second)),
-            "uncertainty_penalty_per_token": float(overrides.get("uncertainty_penalty_per_token", self.config.uncertainty_penalty_per_token)),
-            "missing_summary_penalty": float(overrides.get("missing_summary_penalty", self.config.missing_summary_penalty)),
-        }
-
-    def _ttft_coefficients_for_cluster(self, cluster_id: str) -> dict[str, float]:
-        overrides = self.config.cluster_overrides.get(cluster_id, {})
-        return {
-            "ttft_fixed_overhead": float(overrides.get("ttft_fixed_overhead", self.config.ttft_fixed_overhead)),
-            "ttft_prefill_cost_per_token": float(overrides.get("ttft_prefill_cost_per_token", self.config.ttft_prefill_cost_per_token)),
-            "ttft_queue_depth_penalty": float(overrides.get("ttft_queue_depth_penalty", self.config.ttft_queue_depth_penalty)),
-            "ttft_queue_quadratic_penalty": float(overrides.get("ttft_queue_quadratic_penalty", self.config.ttft_queue_quadratic_penalty)),
-            "ttft_queue_prefill_interaction": float(overrides.get("ttft_queue_prefill_interaction", self.config.ttft_queue_prefill_interaction)),
-            "ttft_stale_penalty_per_second": float(overrides.get("ttft_stale_penalty_per_second", self.config.ttft_stale_penalty_per_second)),
-            "ttft_uncertainty_penalty_per_token": float(overrides.get("ttft_uncertainty_penalty_per_token", self.config.ttft_uncertainty_penalty_per_token)),
-            "ttft_missing_summary_penalty": float(overrides.get("ttft_missing_summary_penalty", self.config.ttft_missing_summary_penalty)),
-        }
+        return cost_coefficients_for_cluster(self.config, cluster_id)

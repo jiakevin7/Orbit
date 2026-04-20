@@ -147,6 +147,7 @@ class LlamaCppClientTests(unittest.TestCase):
                 model_path="/tmp/placeholder.gguf",
                 manage_server=False,
                 parallel=2,
+                prompt_token_cap=256,
             ),
         )
         cluster._started = True
@@ -173,6 +174,40 @@ class LlamaCppClientTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(cluster.queue_depth(now=3.5), 1)
+
+    def test_cluster_prepare_requests_truncates_to_real_prompt_token_budget(self) -> None:
+        cluster = LlamaCppCluster(
+            cluster_id="cluster-a",
+            cluster_config=ClusterConfig(),
+            backend_config=LlamaCppClusterConfig(
+                model_path="/tmp/placeholder.gguf",
+                manage_server=False,
+                parallel=1,
+                ctx_size=256,
+                prompt_token_cap=64,
+            ),
+        )
+        cluster._started = True
+        request_obj = Request(
+            request_id="req-0",
+            arrival_time=0.0,
+            router_id="router-a",
+            prefix_tokens=(1, 2, 3),
+            prompt_prefix_text="User:\n" + ("漢" * 200) + "\n\nAssistant:",
+            continuation_tokens=16,
+        )
+
+        def fake_tokenize(text: str) -> tuple[int, ...]:
+            if len(text) > 80:
+                return tuple(range(200))
+            return tuple(range(max(1, min(64, len(text) // 2))))
+
+        with mock.patch.object(cluster._client, "tokenize", side_effect=fake_tokenize):
+            prepared = cluster.prepare_requests([request_obj])
+
+        self.assertEqual(prepared[0].prefix_token_source, "llama_cpp")
+        self.assertLessEqual(len(prepared[0].prefix_tokens), 64)
+        self.assertLess(len(prepared[0].prompt_text), len(request_obj.prompt_text))
 
     def test_cluster_makes_prefix_reusable_after_prompt_eval(self) -> None:
         cluster = LlamaCppCluster(

@@ -13,21 +13,9 @@ _FEATURE_NAMES = (
     "prefill_cost_per_token",
     "decode_cost_per_token",
     "queue_depth_penalty",
-    "queue_quadratic_penalty",
-    "queue_prefill_interaction",
     "stale_penalty_per_second",
     "uncertainty_penalty_per_token",
     "missing_summary_penalty",
-)
-_TTFT_FEATURE_NAMES = (
-    "ttft_fixed_overhead",
-    "ttft_prefill_cost_per_token",
-    "ttft_queue_depth_penalty",
-    "ttft_queue_quadratic_penalty",
-    "ttft_queue_prefill_interaction",
-    "ttft_stale_penalty_per_second",
-    "ttft_uncertainty_penalty_per_token",
-    "ttft_missing_summary_penalty",
 )
 _REUSE_FEATURE_NAMES = (
     "reuse_intercept",
@@ -65,37 +53,13 @@ class RouterCalibration:
     applied_clusters: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class ClusterRouterCalibration:
-    cluster_id: str
-    record_count: int
-    applied: bool
-    reason: str | None
-    coefficients: dict[str, float]
-    mae: float
-    rmse: float
-    baseline_mae: float
-    baseline_rmse: float
-    ttft_coefficients: dict[str, float] = field(default_factory=dict)
-    ttft_mae: float = 0.0
-    ttft_rmse: float = 0.0
-    ttft_baseline_mae: float = 0.0
-    ttft_baseline_rmse: float = 0.0
-    reuse_coefficients: dict[str, float] = field(default_factory=dict)
-    reuse_mae: float = 0.0
-    reuse_rmse: float = 0.0
-    reuse_baseline_mae: float = 0.0
-    reuse_baseline_rmse: float = 0.0
-
-
 def fit_router_config(
     records: Sequence[ExecutionRecord],
     base_config: RouterConfig,
     source_policy: str = "summary",
     cluster_specific: bool = False,
 ) -> tuple[RouterConfig, RouterCalibration]:
-    if cluster_specific:
-        return _fit_cluster_specific_router_config(records, base_config, source_policy)
+    del cluster_specific
     return _fit_global_router_config(records, base_config, source_policy)
 
 
@@ -111,7 +75,7 @@ def _fit_global_router_config(
             applied=False,
             reason="no_records",
             coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients={name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
+            ttft_coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
             reuse_coefficients={name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES},
             mae=0.0,
             rmse=0.0,
@@ -149,18 +113,35 @@ def _fit_global_router_config(
         reuse_calibrated_records,
         reuse_config,
     )
-    ttft_coefficients, ttft_baseline_mae, ttft_baseline_rmse, ttft_mae, ttft_rmse, ttft_applied, ttft_reason = _fit_ttft_coefficients(
-        reuse_calibrated_records,
-        reuse_config,
-    )
-    if not applied and not reuse_applied and not ttft_applied:
+    calibrated_config = reuse_config
+    if applied:
+        calibrated_config = replace(
+            reuse_config,
+            fixed_overhead=coefficients["fixed_overhead"],
+            prefill_cost_per_token=coefficients["prefill_cost_per_token"],
+            decode_cost_per_token=coefficients["decode_cost_per_token"],
+            queue_depth_penalty=coefficients["queue_depth_penalty"],
+            stale_penalty_per_second=coefficients["stale_penalty_per_second"],
+            uncertainty_penalty_per_token=coefficients["uncertainty_penalty_per_token"],
+            missing_summary_penalty=coefficients["missing_summary_penalty"],
+        )
+
+    ttft_baseline_predictions = [_predict_ttft_record(record, reuse_config) for record in reuse_calibrated_records]
+    ttft_calibrated_predictions = [_predict_ttft_record(record, calibrated_config) for record in reuse_calibrated_records]
+    ttft_targets = [_target_ttft(record) for record in reuse_calibrated_records]
+    ttft_baseline_mae = _mae(ttft_targets, ttft_baseline_predictions)
+    ttft_baseline_rmse = _rmse(ttft_targets, ttft_baseline_predictions)
+    ttft_mae = _mae(ttft_targets, ttft_calibrated_predictions)
+    ttft_rmse = _rmse(ttft_targets, ttft_calibrated_predictions)
+
+    if not applied and not reuse_applied:
         payload = RouterCalibration(
             source_policy=source_policy,
             record_count=len(records),
             applied=False,
-            reason=reason or ttft_reason or reuse_reason,
+            reason=reason or reuse_reason,
             coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients={name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
+            ttft_coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
             reuse_coefficients={name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES},
             mae=baseline_mae,
             rmse=baseline_rmse,
@@ -178,29 +159,6 @@ def _fit_global_router_config(
             calibrated_config=asdict(base_config),
         )
         return base_config, payload
-
-    calibrated_config = reuse_config
-    if applied or ttft_applied:
-        calibrated_config = replace(
-            reuse_config,
-            fixed_overhead=coefficients["fixed_overhead"] if applied else reuse_config.fixed_overhead,
-            prefill_cost_per_token=coefficients["prefill_cost_per_token"] if applied else reuse_config.prefill_cost_per_token,
-            decode_cost_per_token=coefficients["decode_cost_per_token"] if applied else reuse_config.decode_cost_per_token,
-            queue_depth_penalty=coefficients["queue_depth_penalty"] if applied else reuse_config.queue_depth_penalty,
-            queue_quadratic_penalty=coefficients["queue_quadratic_penalty"] if applied else reuse_config.queue_quadratic_penalty,
-            queue_prefill_interaction=coefficients["queue_prefill_interaction"] if applied else reuse_config.queue_prefill_interaction,
-            stale_penalty_per_second=coefficients["stale_penalty_per_second"] if applied else reuse_config.stale_penalty_per_second,
-            uncertainty_penalty_per_token=coefficients["uncertainty_penalty_per_token"] if applied else reuse_config.uncertainty_penalty_per_token,
-            missing_summary_penalty=coefficients["missing_summary_penalty"] if applied else reuse_config.missing_summary_penalty,
-            ttft_fixed_overhead=ttft_coefficients["ttft_fixed_overhead"] if ttft_applied else reuse_config.ttft_fixed_overhead,
-            ttft_prefill_cost_per_token=ttft_coefficients["ttft_prefill_cost_per_token"] if ttft_applied else reuse_config.ttft_prefill_cost_per_token,
-            ttft_queue_depth_penalty=ttft_coefficients["ttft_queue_depth_penalty"] if ttft_applied else reuse_config.ttft_queue_depth_penalty,
-            ttft_queue_quadratic_penalty=ttft_coefficients["ttft_queue_quadratic_penalty"] if ttft_applied else reuse_config.ttft_queue_quadratic_penalty,
-            ttft_queue_prefill_interaction=ttft_coefficients["ttft_queue_prefill_interaction"] if ttft_applied else reuse_config.ttft_queue_prefill_interaction,
-            ttft_stale_penalty_per_second=ttft_coefficients["ttft_stale_penalty_per_second"] if ttft_applied else reuse_config.ttft_stale_penalty_per_second,
-            ttft_uncertainty_penalty_per_token=ttft_coefficients["ttft_uncertainty_penalty_per_token"] if ttft_applied else reuse_config.ttft_uncertainty_penalty_per_token,
-            ttft_missing_summary_penalty=ttft_coefficients["ttft_missing_summary_penalty"] if ttft_applied else reuse_config.ttft_missing_summary_penalty,
-        )
 
     payload = RouterCalibration(
         source_policy=source_policy,
@@ -213,9 +171,9 @@ def _fit_global_router_config(
             else {name: float(getattr(reuse_config, name)) for name in _FEATURE_NAMES}
         ),
         ttft_coefficients=(
-            ttft_coefficients
-            if ttft_applied
-            else {name: float(getattr(reuse_config, name)) for name in _TTFT_FEATURE_NAMES}
+            coefficients
+            if applied
+            else {name: float(getattr(reuse_config, name)) for name in _FEATURE_NAMES}
         ),
         reuse_coefficients=(
             reuse_coefficients
@@ -226,8 +184,8 @@ def _fit_global_router_config(
         rmse=rmse if applied else baseline_rmse,
         baseline_mae=baseline_mae,
         baseline_rmse=baseline_rmse,
-        ttft_mae=ttft_mae if ttft_applied else ttft_baseline_mae,
-        ttft_rmse=ttft_rmse if ttft_applied else ttft_baseline_rmse,
+        ttft_mae=ttft_mae if applied else ttft_baseline_mae,
+        ttft_rmse=ttft_rmse if applied else ttft_baseline_rmse,
         ttft_baseline_mae=ttft_baseline_mae,
         ttft_baseline_rmse=ttft_baseline_rmse,
         reuse_mae=reuse_mae if reuse_applied else reuse_baseline_mae,
@@ -238,210 +196,6 @@ def _fit_global_router_config(
         calibrated_config=asdict(calibrated_config),
     )
     return calibrated_config, payload
-
-
-def _fit_cluster_specific_router_config(
-    records: Sequence[ExecutionRecord],
-    base_config: RouterConfig,
-    source_policy: str,
-) -> tuple[RouterConfig, RouterCalibration]:
-    if not records:
-        payload = RouterCalibration(
-            source_policy=source_policy,
-            record_count=0,
-            applied=False,
-            reason="no_records",
-            coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients={name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
-            reuse_coefficients={name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES},
-            mae=0.0,
-            rmse=0.0,
-            baseline_mae=0.0,
-            baseline_rmse=0.0,
-            ttft_mae=0.0,
-            ttft_rmse=0.0,
-            ttft_baseline_mae=0.0,
-            ttft_baseline_rmse=0.0,
-            reuse_mae=0.0,
-            reuse_rmse=0.0,
-            reuse_baseline_mae=0.0,
-            reuse_baseline_rmse=0.0,
-            base_config=asdict(base_config),
-            calibrated_config=asdict(base_config),
-            scope="per_cluster",
-        )
-        return base_config, payload
-
-    reuse_coefficients, reuse_baseline_mae, reuse_baseline_rmse, reuse_mae, reuse_rmse, reuse_applied, reuse_reason = _fit_reuse_coefficients(
-        records,
-        base_config,
-    )
-    reuse_config = base_config
-    if reuse_applied:
-        reuse_config = replace(
-            base_config,
-            reuse_intercept=reuse_coefficients["reuse_intercept"],
-            reuse_estimate_scale=reuse_coefficients["reuse_estimate_scale"],
-            reuse_match_level_bonus=reuse_coefficients["reuse_match_level_bonus"],
-            reuse_hotset_match_bonus=reuse_coefficients["reuse_hotset_match_bonus"],
-        )
-    reuse_calibrated_records = [_apply_reuse_model_to_record(record, reuse_config) for record in records]
-
-    grouped_records: dict[str, list[ExecutionRecord]] = {}
-    for record in reuse_calibrated_records:
-        grouped_records.setdefault(record.cluster_id, []).append(record)
-
-    cluster_payloads: dict[str, ClusterRouterCalibration] = {}
-    cluster_overrides: dict[str, dict[str, float]] = {}
-    for cluster_id, cluster_records in sorted(grouped_records.items()):
-        coefficients, baseline_mae, baseline_rmse, mae, rmse, applied, reason = _fit_coefficients(
-            cluster_records,
-            reuse_config,
-        )
-        ttft_coefficients, ttft_baseline_mae, ttft_baseline_rmse, ttft_mae, ttft_rmse, ttft_applied, ttft_reason = _fit_ttft_coefficients(
-            cluster_records,
-            reuse_config,
-        )
-        cluster_payloads[cluster_id] = ClusterRouterCalibration(
-            cluster_id=cluster_id,
-            record_count=len(cluster_records),
-            applied=(applied or ttft_applied or reuse_applied),
-            reason=reason if applied else ttft_reason,
-            coefficients=coefficients if applied else {name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients=(
-                ttft_coefficients
-                if ttft_applied
-                else {name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES}
-            ),
-            mae=mae if applied else baseline_mae,
-            rmse=rmse if applied else baseline_rmse,
-            baseline_mae=baseline_mae,
-            baseline_rmse=baseline_rmse,
-            ttft_mae=ttft_mae if ttft_applied else ttft_baseline_mae,
-            ttft_rmse=ttft_rmse if ttft_applied else ttft_baseline_rmse,
-            ttft_baseline_mae=ttft_baseline_mae,
-            ttft_baseline_rmse=ttft_baseline_rmse,
-            reuse_coefficients=(
-                reuse_coefficients
-                if reuse_applied
-                else {name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES}
-            ),
-            reuse_mae=reuse_mae if reuse_applied else reuse_baseline_mae,
-            reuse_rmse=reuse_rmse if reuse_applied else reuse_baseline_rmse,
-            reuse_baseline_mae=reuse_baseline_mae,
-            reuse_baseline_rmse=reuse_baseline_rmse,
-        )
-        override: dict[str, float] = {}
-        if applied:
-            override.update(coefficients)
-        if ttft_applied:
-            override.update(ttft_coefficients)
-        if override:
-            cluster_overrides[cluster_id] = override
-
-    baseline_predictions = [_predict_record(record, reuse_config) for record in reuse_calibrated_records]
-    fitted_config = replace(reuse_config, cluster_overrides=cluster_overrides)
-    calibrated_predictions = [_predict_record(record, fitted_config) for record in reuse_calibrated_records]
-    targets = [_target_latency(record) for record in reuse_calibrated_records]
-    baseline_mae = _mae(targets, baseline_predictions)
-    baseline_rmse = _rmse(targets, baseline_predictions)
-    mae = _mae(targets, calibrated_predictions)
-    rmse = _rmse(targets, calibrated_predictions)
-    baseline_ttft_predictions = [_predict_ttft_record(record, reuse_config) for record in reuse_calibrated_records]
-    calibrated_ttft_predictions = [_predict_ttft_record(record, fitted_config) for record in reuse_calibrated_records]
-    ttft_targets = [_target_ttft(record) for record in reuse_calibrated_records]
-    ttft_baseline_mae = _mae(ttft_targets, baseline_ttft_predictions)
-    ttft_baseline_rmse = _rmse(ttft_targets, baseline_ttft_predictions)
-    ttft_mae = _mae(ttft_targets, calibrated_ttft_predictions)
-    ttft_rmse = _rmse(ttft_targets, calibrated_ttft_predictions)
-
-    if not cluster_overrides and not reuse_applied:
-        payload = RouterCalibration(
-            source_policy=source_policy,
-            record_count=len(records),
-            applied=False,
-            reason="no_cluster_improvement" if not reuse_reason else reuse_reason,
-            coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients={name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
-            reuse_coefficients={name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES},
-            mae=baseline_mae,
-            rmse=baseline_rmse,
-            baseline_mae=baseline_mae,
-            baseline_rmse=baseline_rmse,
-            ttft_mae=ttft_baseline_mae,
-            ttft_rmse=ttft_baseline_rmse,
-            ttft_baseline_mae=ttft_baseline_mae,
-            ttft_baseline_rmse=ttft_baseline_rmse,
-            reuse_mae=reuse_baseline_mae,
-            reuse_rmse=reuse_baseline_rmse,
-            reuse_baseline_mae=reuse_baseline_mae,
-            reuse_baseline_rmse=reuse_baseline_rmse,
-            base_config=asdict(base_config),
-            calibrated_config=asdict(base_config),
-            scope="per_cluster",
-            cluster_calibrations={cluster_id: asdict(payload) for cluster_id, payload in cluster_payloads.items()},
-        )
-        return base_config, payload
-
-    if mae >= baseline_mae and ttft_mae >= ttft_baseline_mae and not reuse_applied:
-        payload = RouterCalibration(
-            source_policy=source_policy,
-            record_count=len(records),
-            applied=False,
-            reason="no_improvement",
-            coefficients={name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            ttft_coefficients={name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
-            reuse_coefficients={name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES},
-            mae=baseline_mae,
-            rmse=baseline_rmse,
-            baseline_mae=baseline_mae,
-            baseline_rmse=baseline_rmse,
-            ttft_mae=ttft_baseline_mae,
-            ttft_rmse=ttft_baseline_rmse,
-            ttft_baseline_mae=ttft_baseline_mae,
-            ttft_baseline_rmse=ttft_baseline_rmse,
-            reuse_mae=reuse_baseline_mae,
-            reuse_rmse=reuse_baseline_rmse,
-            reuse_baseline_mae=reuse_baseline_mae,
-            reuse_baseline_rmse=reuse_baseline_rmse,
-            base_config=asdict(base_config),
-            calibrated_config=asdict(base_config),
-            scope="per_cluster",
-            cluster_calibrations={cluster_id: asdict(payload) for cluster_id, payload in cluster_payloads.items()},
-        )
-        return base_config, payload
-
-    payload = RouterCalibration(
-        source_policy=source_policy,
-        record_count=len(records),
-        applied=True,
-        reason=None,
-        coefficients={name: float(getattr(fitted_config, name)) for name in _FEATURE_NAMES},
-        ttft_coefficients={name: float(getattr(fitted_config, name)) for name in _TTFT_FEATURE_NAMES},
-        reuse_coefficients=(
-            reuse_coefficients
-            if reuse_applied
-            else {name: float(getattr(base_config, name)) for name in _REUSE_FEATURE_NAMES}
-        ),
-        mae=mae,
-        rmse=rmse,
-        baseline_mae=baseline_mae,
-        baseline_rmse=baseline_rmse,
-        ttft_mae=ttft_mae,
-        ttft_rmse=ttft_rmse,
-        ttft_baseline_mae=ttft_baseline_mae,
-        ttft_baseline_rmse=ttft_baseline_rmse,
-        reuse_mae=reuse_mae if reuse_applied else reuse_baseline_mae,
-        reuse_rmse=reuse_rmse if reuse_applied else reuse_baseline_rmse,
-        reuse_baseline_mae=reuse_baseline_mae,
-        reuse_baseline_rmse=reuse_baseline_rmse,
-        base_config=asdict(base_config),
-        calibrated_config=asdict(fitted_config),
-        scope="per_cluster",
-        cluster_calibrations={cluster_id: asdict(payload) for cluster_id, payload in cluster_payloads.items()},
-        applied_clusters=tuple(sorted(cluster_overrides)),
-    )
-    return fitted_config, payload
 
 
 def _fit_coefficients(
@@ -478,11 +232,9 @@ def _fit_coefficients(
         "prefill_cost_per_token": clipped_coefficients[1],
         "decode_cost_per_token": clipped_coefficients[2],
         "queue_depth_penalty": clipped_coefficients[3],
-        "queue_quadratic_penalty": clipped_coefficients[4],
-        "queue_prefill_interaction": clipped_coefficients[5],
-        "stale_penalty_per_second": clipped_coefficients[6],
-        "uncertainty_penalty_per_token": clipped_coefficients[7],
-        "missing_summary_penalty": clipped_coefficients[8],
+        "stale_penalty_per_second": clipped_coefficients[4],
+        "uncertainty_penalty_per_token": clipped_coefficients[5],
+        "missing_summary_penalty": clipped_coefficients[6],
     }
     fitted_predictions = [_predict_latency(row, clipped_coefficients) for row in design_matrix]
     mae = _mae(targets, fitted_predictions)
@@ -490,61 +242,6 @@ def _fit_coefficients(
     if mae >= baseline_mae:
         return (
             {name: float(getattr(base_config, name)) for name in _FEATURE_NAMES},
-            baseline_mae,
-            baseline_rmse,
-            baseline_mae,
-            baseline_rmse,
-            False,
-            "no_improvement",
-        )
-    return coefficient_map, baseline_mae, baseline_rmse, mae, rmse, True, None
-
-
-def _fit_ttft_coefficients(
-    records: Sequence[ExecutionRecord],
-    base_config: RouterConfig,
-) -> tuple[dict[str, float], float, float, float, float, bool, str | None]:
-    design_matrix: list[list[float]] = []
-    targets: list[float] = []
-    baseline_predictions: list[float] = []
-    for record in records:
-        design_matrix.append(_ttft_design_row(record))
-        targets.append(_target_ttft(record))
-        baseline_predictions.append(_predict_ttft_record(record, base_config))
-
-    baseline_mae = _mae(targets, baseline_predictions)
-    baseline_rmse = _rmse(targets, baseline_predictions)
-
-    minimum_records = max(8, len(_TTFT_FEATURE_NAMES) + 1)
-    if len(records) < minimum_records:
-        return (
-            {name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
-            baseline_mae,
-            baseline_rmse,
-            baseline_mae,
-            baseline_rmse,
-            False,
-            f"need_at_least_{minimum_records}_records",
-        )
-
-    coefficients = _solve_ridge(design_matrix, targets, ridge=1e-6)
-    clipped_coefficients = [max(0.0, coefficient) for coefficient in coefficients]
-    coefficient_map = {
-        "ttft_fixed_overhead": clipped_coefficients[0],
-        "ttft_prefill_cost_per_token": clipped_coefficients[1],
-        "ttft_queue_depth_penalty": clipped_coefficients[2],
-        "ttft_queue_quadratic_penalty": clipped_coefficients[3],
-        "ttft_queue_prefill_interaction": clipped_coefficients[4],
-        "ttft_stale_penalty_per_second": clipped_coefficients[5],
-        "ttft_uncertainty_penalty_per_token": clipped_coefficients[6],
-        "ttft_missing_summary_penalty": clipped_coefficients[7],
-    }
-    fitted_predictions = [_predict_latency(row, clipped_coefficients) for row in design_matrix]
-    mae = _mae(targets, fitted_predictions)
-    rmse = _rmse(targets, fitted_predictions)
-    if mae >= baseline_mae:
-        return (
-            {name: float(getattr(base_config, name)) for name in _TTFT_FEATURE_NAMES},
             baseline_mae,
             baseline_rmse,
             baseline_mae,
@@ -638,23 +335,6 @@ def _latency_design_row(record: ExecutionRecord) -> list[float]:
         remaining_prefill,
         float(record.continuation_tokens),
         queue_depth,
-        queue_depth ** 2,
-        queue_depth * remaining_prefill,
-        float(record.metadata_age),
-        float(record.uncertainty_gap),
-        1.0 if record.missing_summary else 0.0,
-    ]
-
-
-def _ttft_design_row(record: ExecutionRecord) -> list[float]:
-    queue_depth = float(record.route_queue_depth)
-    remaining_prefill = float(record.estimated_remaining_prefill_tokens)
-    return [
-        1.0,
-        remaining_prefill,
-        queue_depth,
-        queue_depth ** 2,
-        queue_depth * remaining_prefill,
         float(record.metadata_age),
         float(record.uncertainty_gap),
         1.0 if record.missing_summary else 0.0,
@@ -662,16 +342,13 @@ def _ttft_design_row(record: ExecutionRecord) -> list[float]:
 
 
 def _predict_record(record: ExecutionRecord, config: RouterConfig) -> float:
-    overrides = config.cluster_overrides.get(record.cluster_id, {})
-    fixed_overhead = float(overrides.get("fixed_overhead", config.fixed_overhead))
-    prefill_cost = float(overrides.get("prefill_cost_per_token", config.prefill_cost_per_token))
-    decode_cost = float(overrides.get("decode_cost_per_token", config.decode_cost_per_token))
-    queue_penalty = float(overrides.get("queue_depth_penalty", config.queue_depth_penalty))
-    queue_quadratic_penalty = float(overrides.get("queue_quadratic_penalty", config.queue_quadratic_penalty))
-    queue_prefill_interaction = float(overrides.get("queue_prefill_interaction", config.queue_prefill_interaction))
-    stale_penalty = float(overrides.get("stale_penalty_per_second", config.stale_penalty_per_second))
-    uncertainty_penalty = float(overrides.get("uncertainty_penalty_per_token", config.uncertainty_penalty_per_token))
-    missing_penalty = float(overrides.get("missing_summary_penalty", config.missing_summary_penalty))
+    fixed_overhead = float(config.fixed_overhead)
+    prefill_cost = float(config.prefill_cost_per_token)
+    decode_cost = float(config.decode_cost_per_token)
+    queue_penalty = float(config.queue_depth_penalty)
+    stale_penalty = float(config.stale_penalty_per_second)
+    uncertainty_penalty = float(config.uncertainty_penalty_per_token)
+    missing_penalty = float(config.missing_summary_penalty)
     queue_depth = float(record.route_queue_depth)
     remaining_prefill = float(record.estimated_remaining_prefill_tokens)
     return max(
@@ -680,8 +357,6 @@ def _predict_record(record: ExecutionRecord, config: RouterConfig) -> float:
         + remaining_prefill * prefill_cost
         + record.continuation_tokens * decode_cost
         + queue_depth * queue_penalty
-        + (queue_depth ** 2) * queue_quadratic_penalty
-        + (queue_depth * remaining_prefill) * queue_prefill_interaction
         + record.metadata_age * stale_penalty
         + record.uncertainty_gap * uncertainty_penalty
         + (missing_penalty if record.missing_summary else 0.0),
@@ -689,19 +364,12 @@ def _predict_record(record: ExecutionRecord, config: RouterConfig) -> float:
 
 
 def _predict_ttft_record(record: ExecutionRecord, config: RouterConfig) -> float:
-    overrides = config.cluster_overrides.get(record.cluster_id, {})
-    fixed_overhead = float(overrides.get("ttft_fixed_overhead", config.ttft_fixed_overhead))
-    prefill_cost = float(overrides.get("ttft_prefill_cost_per_token", config.ttft_prefill_cost_per_token))
-    queue_penalty = float(overrides.get("ttft_queue_depth_penalty", config.ttft_queue_depth_penalty))
-    queue_quadratic_penalty = float(overrides.get("ttft_queue_quadratic_penalty", config.ttft_queue_quadratic_penalty))
-    queue_prefill_interaction = float(
-        overrides.get("ttft_queue_prefill_interaction", config.ttft_queue_prefill_interaction)
-    )
-    stale_penalty = float(overrides.get("ttft_stale_penalty_per_second", config.ttft_stale_penalty_per_second))
-    uncertainty_penalty = float(
-        overrides.get("ttft_uncertainty_penalty_per_token", config.ttft_uncertainty_penalty_per_token)
-    )
-    missing_penalty = float(overrides.get("ttft_missing_summary_penalty", config.ttft_missing_summary_penalty))
+    fixed_overhead = float(config.fixed_overhead)
+    prefill_cost = float(config.prefill_cost_per_token)
+    queue_penalty = float(config.queue_depth_penalty)
+    stale_penalty = float(config.stale_penalty_per_second)
+    uncertainty_penalty = float(config.uncertainty_penalty_per_token)
+    missing_penalty = float(config.missing_summary_penalty)
     queue_depth = float(record.route_queue_depth)
     remaining_prefill = float(record.estimated_remaining_prefill_tokens)
     return max(
@@ -709,8 +377,6 @@ def _predict_ttft_record(record: ExecutionRecord, config: RouterConfig) -> float
         fixed_overhead
         + remaining_prefill * prefill_cost
         + queue_depth * queue_penalty
-        + (queue_depth ** 2) * queue_quadratic_penalty
-        + (queue_depth * remaining_prefill) * queue_prefill_interaction
         + record.metadata_age * stale_penalty
         + record.uncertainty_gap * uncertainty_penalty
         + (missing_penalty if record.missing_summary else 0.0),
@@ -718,12 +384,11 @@ def _predict_ttft_record(record: ExecutionRecord, config: RouterConfig) -> float
 
 
 def _predict_reuse_record(record: ExecutionRecord, config: RouterConfig) -> int:
-    overrides = config.cluster_overrides.get(record.cluster_id, {})
     coefficients = [
-        float(overrides.get("reuse_intercept", config.reuse_intercept)),
-        float(overrides.get("reuse_estimate_scale", config.reuse_estimate_scale)),
-        float(overrides.get("reuse_match_level_bonus", config.reuse_match_level_bonus)),
-        float(overrides.get("reuse_hotset_match_bonus", config.reuse_hotset_match_bonus)),
+        float(config.reuse_intercept),
+        float(config.reuse_estimate_scale),
+        float(config.reuse_match_level_bonus),
+        float(config.reuse_hotset_match_bonus),
     ]
     if _raw_reuse_signal(record) <= 0 and record.summary_matched_levels <= 0 and record.hotset_matched_levels <= 0:
         return 0

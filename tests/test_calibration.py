@@ -63,8 +63,6 @@ class CalibrationTests(unittest.TestCase):
             prefill_cost_per_token=0.02,
             decode_cost_per_token=0.05,
             queue_depth_penalty=0.4,
-            queue_quadratic_penalty=0.07,
-            queue_prefill_interaction=0.003,
             stale_penalty_per_second=0.1,
             uncertainty_penalty_per_token=0.03,
             missing_summary_penalty=1.2,
@@ -92,8 +90,6 @@ class CalibrationTests(unittest.TestCase):
                 + remaining_prefill * target_config.prefill_cost_per_token
                 + continuation * target_config.decode_cost_per_token
                 + queue_depth * target_config.queue_depth_penalty
-                + (queue_depth ** 2) * target_config.queue_quadratic_penalty
-                + (queue_depth * remaining_prefill) * target_config.queue_prefill_interaction
                 + metadata_age * target_config.stale_penalty_per_second
                 + uncertainty_gap * target_config.uncertainty_penalty_per_token
                 + (target_config.missing_summary_penalty if missing_summary else 0.0)
@@ -137,8 +133,6 @@ class CalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(calibrated_config.prefill_cost_per_token, target_config.prefill_cost_per_token, places=4)
         self.assertAlmostEqual(calibrated_config.decode_cost_per_token, target_config.decode_cost_per_token, places=4)
         self.assertAlmostEqual(calibrated_config.queue_depth_penalty, target_config.queue_depth_penalty, places=4)
-        self.assertAlmostEqual(calibrated_config.queue_quadratic_penalty, target_config.queue_quadratic_penalty, places=4)
-        self.assertAlmostEqual(calibrated_config.queue_prefill_interaction, target_config.queue_prefill_interaction, places=4)
         self.assertAlmostEqual(calibrated_config.stale_penalty_per_second, target_config.stale_penalty_per_second, places=4)
         self.assertAlmostEqual(calibrated_config.uncertainty_penalty_per_token, target_config.uncertainty_penalty_per_token, places=4)
         self.assertAlmostEqual(calibrated_config.missing_summary_penalty, target_config.missing_summary_penalty, places=4)
@@ -186,9 +180,9 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertEqual(calibrated_config, base_config)
         self.assertFalse(calibration.applied)
-        self.assertEqual(calibration.reason, "need_at_least_10_records")
+        self.assertEqual(calibration.reason, "need_at_least_8_records")
 
-    def test_fit_router_config_can_emit_cluster_specific_overrides(self) -> None:
+    def test_fit_router_config_uses_one_global_policy(self) -> None:
         base_config = RouterConfig()
         records: list[ExecutionRecord] = []
         for index in range(10):
@@ -258,12 +252,13 @@ class CalibrationTests(unittest.TestCase):
                 )
             )
 
-        calibrated_config, calibration = fit_router_config(records, base_config, cluster_specific=True)
+        calibrated_config, calibration = fit_router_config(records, base_config)
 
         self.assertTrue(calibration.applied)
-        self.assertEqual(calibration.scope, "per_cluster")
-        self.assertEqual(set(calibrated_config.cluster_overrides), {"cluster-0", "cluster-1"})
-        self.assertEqual(set(calibration.applied_clusters), {"cluster-0", "cluster-1"})
+        self.assertEqual(calibration.scope, "global")
+        self.assertEqual(calibration.applied_clusters, ())
+        self.assertEqual(calibration.cluster_calibrations, {})
+        self.assertNotEqual(calibrated_config, base_config)
 
 
 if __name__ == "__main__":

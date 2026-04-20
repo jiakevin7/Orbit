@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, replace
 
 from .benchmark import (
+    resolve_prompt_prefix_token_cap,
     resolve_reachable_clusters_per_router,
     select_config_by_validation,
     split_workload,
@@ -30,6 +31,7 @@ def main() -> None:
     parser.add_argument("--reachable-clusters-per-router", type=int)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--cache-token-capacity", type=int)
+    parser.add_argument("--prompt-prefix-token-cap", type=int)
     parser.add_argument("--workload-kind", choices=("synthetic", "mixed_realistic"), default="synthetic")
     parser.add_argument("--sharegpt-path", help="path to a ShareGPT-style JSON or JSONL dataset")
     parser.add_argument("--rag-path", help="path to a RAG-style JSON or JSONL dataset")
@@ -37,10 +39,10 @@ def main() -> None:
     parser.add_argument("--sharegpt-sample-limit", type=int, default=2000)
     parser.add_argument("--rag-sample-limit", type=int, default=2000)
     parser.add_argument("--agent-sample-limit", type=int, default=2000)
-    parser.add_argument("--traffic-mix-chat", type=float, default=0.35)
-    parser.add_argument("--traffic-mix-rag", type=float, default=0.25)
-    parser.add_argument("--traffic-mix-agent", type=float, default=0.20)
-    parser.add_argument("--traffic-mix-bursty", type=float, default=0.20)
+    parser.add_argument("--traffic-mix-chat", type=float, default=0.4375)
+    parser.add_argument("--traffic-mix-rag", type=float, default=0.3125)
+    parser.add_argument("--traffic-mix-agent", type=float, default=0.25)
+    parser.add_argument("--traffic-mix-bursty", type=float, default=0.0)
     parser.add_argument("--warmup-requests", type=int, default=0, help="number of warm-up requests excluded from reported metrics")
     parser.add_argument(
         "--validation-requests",
@@ -128,6 +130,7 @@ def main() -> None:
                 parallel=args.llama_parallel,
                 request_timeout=args.llama_timeout,
                 startup_timeout=args.llama_startup_timeout,
+                prompt_token_cap=resolve_prompt_prefix_token_cap(args),
                 extra_args=tuple(args.llama_extra_arg),
             )
             if args.backend == "llama_cpp"
@@ -163,6 +166,7 @@ def main() -> None:
             traffic_mix_rag=args.traffic_mix_rag,
             traffic_mix_agent=args.traffic_mix_agent,
             traffic_mix_bursty=args.traffic_mix_bursty,
+            prompt_prefix_token_cap=resolve_prompt_prefix_token_cap(args),
             seed=args.seed,
         ),
     )
@@ -196,7 +200,6 @@ def main() -> None:
             calibration_records,
             config.router_config,
             source_policy=args.calibration_policy,
-            cluster_specific=True,
         )
         calibrated_config = replace(config, router_config=calibrated_router_config)
         calibration_payload = asdict(calibration)

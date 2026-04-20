@@ -43,14 +43,14 @@ class WorkloadConfig:
     rag_sample_limit: int = 2_000
     agent_path: str | None = None
     agent_sample_limit: int = 2_000
-    traffic_mix_chat: float = 0.35
-    traffic_mix_rag: float = 0.25
-    traffic_mix_agent: float = 0.20
-    traffic_mix_bursty: float = 0.20
+    traffic_mix_chat: float = 0.4375
+    traffic_mix_rag: float = 0.3125
+    traffic_mix_agent: float = 0.25
+    traffic_mix_bursty: float = 0.0
     session_affinity_probability: float = 0.85
     burst_size_choices: tuple[int, ...] = (2, 3)
     burst_interarrival_ratio: float = 0.05
-    traffic_burst_probability: float = 0.15
+    traffic_burst_probability: float = 0.0
     dataset_continuation_floor: int = 8
     dataset_continuation_cap: int = 96
     prompt_prefix_token_cap: int | None = 4096
@@ -284,6 +284,15 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
     rag_corpora = _default_rag_corpora()
     tool_catalogs = _default_tool_catalogs()
     session_router_map: dict[str, str] = {}
+    source_variant_counts: dict[tuple[str, str], int] = {}
+    chat_turn_pool = _build_chat_turn_pool(chat_examples, rng)
+    if not chat_turn_pool:
+        chat_examples = _default_chat_examples()
+        chat_turn_pool = _build_chat_turn_pool(chat_examples, rng)
+    rag_example_pool = _build_rag_example_pool(rag_examples, rng)
+    agent_turn_pool = _build_agent_turn_pool(agent_examples, rng)
+    if agent_examples and not agent_turn_pool:
+        agent_examples = []
 
     positive_traffic_types = [
         traffic_type
@@ -320,7 +329,9 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
                 request_index=request_index,
                 arrival_time=arrival_time,
                 chat_examples=chat_examples,
+                chat_turn_pool=chat_turn_pool,
                 session_router_map=session_router_map,
+                source_variant_counts=source_variant_counts,
             )
             requests.append(request_obj)
             request_index += 1
@@ -344,7 +355,9 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
                 request_index=request_index,
                 arrival_time=arrival_time,
                 rag_examples=rag_examples,
+                rag_example_pool=rag_example_pool,
                 rag_corpora=rag_corpora,
+                source_variant_counts=source_variant_counts,
             )
             requests.append(request_obj)
             request_index += 1
@@ -368,8 +381,10 @@ def _generate_mixed_realistic_workload(config: WorkloadConfig) -> list[Request]:
                 request_index=request_index,
                 arrival_time=arrival_time,
                 agent_examples=agent_examples,
+                agent_turn_pool=agent_turn_pool,
                 tool_catalogs=tool_catalogs,
                 session_router_map=session_router_map,
+                source_variant_counts=source_variant_counts,
             )
             requests.append(request_obj)
             request_index += 1
@@ -409,21 +424,21 @@ def _build_sharegpt_chat_request(
     request_index: int,
     arrival_time: float,
     chat_examples: Sequence[ConversationExample],
+    chat_turn_pool: list[tuple[ConversationExample, int]],
     session_router_map: dict[str, str],
+    source_variant_counts: dict[tuple[str, str], int],
 ) -> Request:
-    example = rng.choice(tuple(chat_examples))
-    candidate_indices = [
-        index
-        for index, (role, _) in enumerate(example.messages)
-        if role == "user" and _next_message_content(example.messages, index + 1, "assistant") is not None
-    ]
-    if not candidate_indices:
-        raise ValueError("chat example did not contain a usable user -> assistant transition")
-
-    user_index = rng.choice(candidate_indices)
+    example, user_index = _next_conversation_turn(chat_turn_pool, chat_examples, rng)
     assistant_response = _next_message_content(example.messages, user_index + 1, "assistant") or ""
     prompt_prefix_text = render_message_prompt(example.messages[: user_index + 1])
     session_id = f"chat-{example.conversation_id}"
+    base_source_id = f"{example.conversation_id}:turn-{user_index}"
+    prompt_prefix_text, source_id = _apply_request_variant(
+        prompt_prefix_text=prompt_prefix_text,
+        traffic_class=CHAT_TRAFFIC_CLASS,
+        base_source_id=base_source_id,
+        source_variant_counts=source_variant_counts,
+    )
     router_id = _choose_router_for_session(
         router_ids=config.router_ids,
         session_id=session_id,
@@ -440,7 +455,7 @@ def _build_sharegpt_chat_request(
         continuation_tokens=_continuation_tokens_from_text(assistant_response, config),
         traffic_class=CHAT_TRAFFIC_CLASS,
         session_id=session_id,
-        source_id=example.conversation_id,
+        source_id=source_id,
     )
 
 
@@ -450,10 +465,12 @@ def _build_rag_request(
     request_index: int,
     arrival_time: float,
     rag_examples: Sequence[RagExample],
+    rag_example_pool: list[RagExample],
     rag_corpora: dict[str, tuple[tuple[str, str], ...]],
+    source_variant_counts: dict[tuple[str, str], int],
 ) -> Request:
     if rag_examples:
-        example = rng.choice(tuple(rag_examples))
+        example = _next_rag_example(rag_example_pool, rag_examples, rng)
         chosen_docs = list(example.contexts)
         if len(chosen_docs) > 3:
             chosen_docs = rng.sample(chosen_docs, k=rng.randint(2, 3))
@@ -477,6 +494,12 @@ def _build_rag_request(
             ("Assistant", ""),
         ]
         prompt_prefix_text = render_section_prompt(prompt_sections)
+        prompt_prefix_text, source_id = _apply_request_variant(
+            prompt_prefix_text=prompt_prefix_text,
+            traffic_class=RAG_TRAFFIC_CLASS,
+            base_source_id=example.example_id,
+            source_variant_counts=source_variant_counts,
+        )
         continuation_seed = example.answer or " ".join(doc_text for _, doc_text in chosen_docs[:1])
         return _build_request(
             config=config,
@@ -486,7 +509,7 @@ def _build_rag_request(
             prompt_prefix_text=prompt_prefix_text,
             continuation_tokens=_continuation_tokens_from_text(continuation_seed, config),
             traffic_class=RAG_TRAFFIC_CLASS,
-            source_id=example.example_id,
+            source_id=source_id,
         )
 
     corpus_id = rng.choice(sorted(rag_corpora))
@@ -513,6 +536,12 @@ def _build_rag_request(
         ("Assistant", ""),
     ]
     prompt_prefix_text = render_section_prompt(prompt_sections)
+    prompt_prefix_text, source_id = _apply_request_variant(
+        prompt_prefix_text=prompt_prefix_text,
+        traffic_class=RAG_TRAFFIC_CLASS,
+        base_source_id=corpus_id,
+        source_variant_counts=source_variant_counts,
+    )
     continuation_seed = " ".join(doc_text for _, doc_text in chosen_docs[:1])
     return _build_request(
         config=config,
@@ -522,7 +551,7 @@ def _build_rag_request(
         prompt_prefix_text=prompt_prefix_text,
         continuation_tokens=_continuation_tokens_from_text(continuation_seed, config),
         traffic_class=RAG_TRAFFIC_CLASS,
-        source_id=corpus_id,
+        source_id=source_id,
     )
 
 
@@ -532,25 +561,24 @@ def _build_agent_request(
     request_index: int,
     arrival_time: float,
     agent_examples: Sequence[ConversationExample],
+    agent_turn_pool: list[tuple[ConversationExample, int]],
     tool_catalogs: dict[str, tuple[tuple[str, str], ...]],
     session_router_map: dict[str, str],
+    source_variant_counts: dict[tuple[str, str], int],
 ) -> Request:
     if agent_examples:
-        example = rng.choice(tuple(agent_examples))
-        candidate_indices = [
-            index
-            for index, (role, _) in enumerate(example.messages)
-            if role == "user" and _next_agent_turn_seed(example.messages, index + 1) is not None
-        ]
-        if candidate_indices:
-            user_index = rng.choice(candidate_indices)
-            prompt_prefix_text = render_message_prompt(example.messages[: user_index + 1])
-            continuation_seed = _next_agent_turn_seed(example.messages, user_index + 1) or ""
-        else:
-            prompt_prefix_text = render_message_prompt(example.messages)
-            continuation_seed = _next_agent_turn_seed(example.messages, 0) or prompt_prefix_text
+        example, user_index = _next_conversation_turn(agent_turn_pool, agent_examples, rng, agent_mode=True)
+        prompt_prefix_text = render_message_prompt(example.messages[: user_index + 1])
+        continuation_seed = _next_agent_turn_seed(example.messages, user_index + 1) or example.messages[user_index][1]
 
         session_id = f"agent-{example.conversation_id}"
+        base_source_id = f"{example.conversation_id}:turn-{user_index}"
+        prompt_prefix_text, source_id = _apply_request_variant(
+            prompt_prefix_text=prompt_prefix_text,
+            traffic_class=AGENT_TRAFFIC_CLASS,
+            base_source_id=base_source_id,
+            source_variant_counts=source_variant_counts,
+        )
         router_id = _choose_router_for_session(
             router_ids=config.router_ids,
             session_id=session_id,
@@ -567,7 +595,7 @@ def _build_agent_request(
             continuation_tokens=_continuation_tokens_from_text(continuation_seed, config),
             traffic_class=AGENT_TRAFFIC_CLASS,
             session_id=session_id,
-            source_id=example.conversation_id,
+            source_id=source_id,
         )
 
     catalog_id = rng.choice(sorted(tool_catalogs))
@@ -599,6 +627,12 @@ def _build_agent_request(
         ("Assistant", ""),
     ]
     prompt_prefix_text = render_section_prompt(prompt_sections)
+    prompt_prefix_text, source_id = _apply_request_variant(
+        prompt_prefix_text=prompt_prefix_text,
+        traffic_class=AGENT_TRAFFIC_CLASS,
+        base_source_id=catalog_id,
+        source_variant_counts=source_variant_counts,
+    )
     return _build_request(
         config=config,
         request_id=f"req-{request_index:05d}",
@@ -608,7 +642,7 @@ def _build_agent_request(
         continuation_tokens=_continuation_tokens_from_text(prior_context, config),
         traffic_class=AGENT_TRAFFIC_CLASS,
         session_id=session_id,
-        source_id=catalog_id,
+        source_id=source_id,
     )
 
 
@@ -707,14 +741,29 @@ def _build_followup_burst_requests(
             0.01,
             config.mean_interarrival * config.burst_interarrival_ratio * rng.uniform(0.25, 1.25),
         )
+        followup_prompt = _build_followup_prompt_from_request(
+            base_request=base_request,
+            rng=rng,
+            offset=offset,
+        )
+        followup_continuation = max(
+            config.dataset_continuation_floor,
+            min(
+                config.dataset_continuation_cap,
+                max(
+                    base_request.continuation_tokens,
+                    _continuation_tokens_from_text(followup_prompt, config),
+                ),
+            ),
+        )
         requests.append(
-            Request(
+            _build_request(
+                config=config,
                 request_id=f"req-{request_index_start + offset - 1:05d}",
                 arrival_time=current_arrival,
                 router_id=base_request.router_id,
-                prefix_tokens=base_request.prefix_tokens,
-                continuation_tokens=base_request.continuation_tokens,
-                prompt_prefix_text=base_request.prompt_prefix_text,
+                prompt_prefix_text=followup_prompt,
+                continuation_tokens=followup_continuation,
                 traffic_class=base_request.traffic_class,
                 session_id=base_request.session_id,
                 source_id=base_request.source_id,
@@ -1323,6 +1372,74 @@ def _next_agent_turn_seed(
     return "\n\n".join(collected)
 
 
+def _build_chat_turn_pool(
+    chat_examples: Sequence[ConversationExample],
+    rng: random.Random,
+) -> list[tuple[ConversationExample, int]]:
+    pool = [
+        (example, index)
+        for example in chat_examples
+        for index, (role, _) in enumerate(example.messages)
+        if role == "user" and _next_message_content(example.messages, index + 1, "assistant") is not None
+    ]
+    rng.shuffle(pool)
+    return pool
+
+
+def _build_agent_turn_pool(
+    agent_examples: Sequence[ConversationExample],
+    rng: random.Random,
+) -> list[tuple[ConversationExample, int]]:
+    pool = [
+        (example, index)
+        for example in agent_examples
+        for index, (role, _) in enumerate(example.messages)
+        if role == "user"
+    ]
+    rng.shuffle(pool)
+    return pool
+
+
+def _build_rag_example_pool(
+    rag_examples: Sequence[RagExample],
+    rng: random.Random,
+) -> list[RagExample]:
+    pool = list(rag_examples)
+    rng.shuffle(pool)
+    return pool
+
+
+def _next_conversation_turn(
+    pool: list[tuple[ConversationExample, int]],
+    examples: Sequence[ConversationExample],
+    rng: random.Random,
+    *,
+    agent_mode: bool = False,
+) -> tuple[ConversationExample, int]:
+    if not pool:
+        refill = (
+            _build_agent_turn_pool(examples, rng)
+            if agent_mode
+            else _build_chat_turn_pool(examples, rng)
+        )
+        if not refill:
+            raise ValueError("conversation examples did not contain a usable user turn")
+        pool.extend(refill)
+    return pool.pop()
+
+
+def _next_rag_example(
+    pool: list[RagExample],
+    examples: Sequence[RagExample],
+    rng: random.Random,
+) -> RagExample:
+    if not pool:
+        pool.extend(_build_rag_example_pool(examples, rng))
+    if not pool:
+        raise ValueError("rag examples did not contain a usable example")
+    return pool.pop()
+
+
 def _choose_router_for_session(
     router_ids: Sequence[str],
     session_id: str,
@@ -1344,6 +1461,62 @@ def _continuation_tokens_from_text(text: str, config: WorkloadConfig) -> int:
         config.dataset_continuation_floor,
         min(config.dataset_continuation_cap, token_count),
     )
+
+
+def _build_followup_prompt_from_request(
+    *,
+    base_request: Request,
+    rng: random.Random,
+    offset: int,
+) -> str:
+    return _build_followup_prompt_from_text(
+        base_prompt_text=base_request.prompt_prefix_text or "",
+        traffic_class=base_request.traffic_class,
+        offset=offset,
+    )
+
+
+def _apply_request_variant(
+    *,
+    prompt_prefix_text: str,
+    traffic_class: str,
+    base_source_id: str,
+    source_variant_counts: dict[tuple[str, str], int],
+) -> tuple[str, str]:
+    variant_key = (traffic_class, base_source_id)
+    variant_index = source_variant_counts.get(variant_key, 0)
+    source_variant_counts[variant_key] = variant_index + 1
+    if variant_index == 0:
+        return prompt_prefix_text, base_source_id
+    return (
+        _build_followup_prompt_from_text(
+            base_prompt_text=prompt_prefix_text,
+            traffic_class=traffic_class,
+            offset=variant_index,
+        ),
+        f"{base_source_id}:variant-{variant_index}",
+    )
+
+
+def _build_followup_prompt_from_text(
+    *,
+    base_prompt_text: str,
+    traffic_class: str,
+    offset: int,
+) -> str:
+    followup_catalog = _FOLLOWUP_PROMPTS_BY_TRAFFIC.get(
+        traffic_class,
+        _FOLLOWUP_PROMPTS_BY_TRAFFIC[CHAT_TRAFFIC_CLASS],
+    )
+    followup_text = followup_catalog[(offset - 1) % len(followup_catalog)]
+    base_prompt = base_prompt_text.rstrip()
+    if base_prompt.endswith("Assistant:"):
+        assistant_bridge = _ASSISTANT_BRIDGE_BY_TRAFFIC.get(
+            traffic_class,
+            _ASSISTANT_BRIDGE_BY_TRAFFIC[CHAT_TRAFFIC_CLASS],
+        )
+        base_prompt = f"{base_prompt}\n{assistant_bridge}"
+    return f"{base_prompt}\n\nUser:\n{followup_text}\n\nAssistant:"
 
 
 def _traffic_mix(config: WorkloadConfig) -> dict[str, float]:
@@ -1601,6 +1774,30 @@ _BURSTY_FOLLOWUPS = (
     "A teammate asked the same question from another region. Give the shortest operational answer with the safest next action.",
     "The incident channel needs an immediate update. Repeat the recommendation and trim it to three sentences.",
 )
+
+_ASSISTANT_BRIDGE_BY_TRAFFIC = {
+    CHAT_TRAFFIC_CLASS: "The assistant responded with a concise operator-facing summary.",
+    RAG_TRAFFIC_CLASS: "The assistant answered using the retrieved passages and cited the strongest evidence.",
+    AGENT_TRAFFIC_CLASS: "The assistant proposed the initial tool plan and summarized the next action.",
+}
+
+_FOLLOWUP_PROMPTS_BY_TRAFFIC = {
+    CHAT_TRAFFIC_CLASS: (
+        "Clarify which assumption in the previous answer is most likely to break if router metadata is stale.",
+        "Rewrite the recommendation for an on-call engineer who only has thirty seconds to act.",
+        "State one concrete next check if the same issue appears again in another region.",
+    ),
+    RAG_TRAFFIC_CLASS: (
+        "Answer the same question again, but emphasize the strongest cited passage and one caveat.",
+        "If one retrieved passage were removed, explain which conclusion would become least certain.",
+        "Summarize the retrieved evidence in two sentences for an operations review note.",
+    ),
+    AGENT_TRAFFIC_CLASS: (
+        "Given the previous tool plan, explain the safest next tool call if the first result is inconclusive.",
+        "Trim the plan to the minimum set of tools needed before escalating to a human operator.",
+        "Describe how the tool sequence changes if the first lookup returns stale information.",
+    ),
+}
 
 
 def _build_template_words(
