@@ -8,25 +8,34 @@ from typing import Mapping
 
 
 POLICY_ORDER = (
+    "orbit",
+    "least_loaded",
+    "random",
+    "round_robin",
     "summary",
     "vllm_prefix_mock",
     "vllm_kv_mock",
     "load_only",
-    "random",
     "exact_prefix",
     "oracle",
 )
 POLICY_LABELS = {
-    "summary": "Summary Router",
-    "vllm_prefix_mock": "vLLM Prefix Mock",
-    "vllm_kv_mock": "vLLM KV Mock",
-    "load_only": "Load Only",
+    "orbit": "Orbit",
+    "summary": "Orbit",
+    "least_loaded": "Least Loaded",
+    "load_only": "Least Loaded",
+    "round_robin": "Round Robin",
+    "vllm_prefix_mock": "vLLM Prefix-Style Mock",
+    "vllm_kv_mock": "vLLM KV-Style Mock",
     "random": "Random",
     "exact_prefix": "Exact Prefix",
     "oracle": "Oracle",
 }
 POLICY_PALETTE = {
+    "orbit": "#1d4ed8",
     "summary": "#1d4ed8",
+    "least_loaded": "#ea580c",
+    "round_robin": "#2563eb",
     "vllm_prefix_mock": "#0f766e",
     "vllm_kv_mock": "#7c3aed",
     "load_only": "#ea580c",
@@ -35,7 +44,10 @@ POLICY_PALETTE = {
     "oracle": "#6d28d9",
 }
 POLICY_LINESTYLES = {
+    "orbit": "-",
     "summary": "-",
+    "least_loaded": "-.",
+    "round_robin": (0, (2, 2)),
     "vllm_prefix_mock": (0, (6, 2)),
     "vllm_kv_mock": (0, (3, 2)),
     "load_only": "-.",
@@ -43,17 +55,6 @@ POLICY_LINESTYLES = {
     "exact_prefix": "--",
     "oracle": (0, (5, 2)),
 }
-
-CORE_RESEARCH_PLOTS = (
-    "ttft_cdf.png",
-    "latency_cdf.png",
-    "ttft_by_policy.png",
-    "latency_by_policy.png",
-    "reuse_latency_tradeoff.png",
-    "latency_by_traffic.png",
-    "reuse_by_traffic.png",
-)
-
 
 def generate_run_plots(run_dir: str | Path, recursive: bool = True) -> list[Path]:
     root = Path(run_dir).resolve()
@@ -456,190 +457,6 @@ def _save_policy_interval_plot(
         note += ", faint intervals = per-seed runs"
     axis.text(0.0, -0.16, note, transform=axis.transAxes, ha="left", va="top", fontsize=10, color="#4b5563")
     figure.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-    return output_path
-
-
-def _save_histogram_plot(dataframe, x_field: str, output_path: Path, title: str, x_label: str) -> Path:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    order = _policy_order(dataframe)
-    palette = _policy_palette(order)
-    figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
-    sns.histplot(
-        data=dataframe,
-        x=x_field,
-        hue="policy",
-        hue_order=order,
-        palette=palette,
-        element="step",
-        fill=False,
-        common_norm=False,
-        bins=12,
-        ax=axis,
-    )
-    axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel("Request count")
-    axis.grid(True, alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-    return output_path
-
-
-def _save_scatter_plot(
-    dataframe,
-    x_field: str,
-    y_field: str,
-    output_path: Path,
-    title: str,
-    x_label: str,
-    y_label: str,
-) -> Path:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    order = _policy_order(dataframe)
-    palette = _policy_palette(order)
-    figure, axis = plt.subplots(figsize=(8.8, 7.2), dpi=150)
-    sns.scatterplot(
-        data=dataframe,
-        x=x_field,
-        y=y_field,
-        hue="policy",
-        hue_order=order,
-        palette=palette,
-        s=70,
-        alpha=0.8,
-        ax=axis,
-    )
-    max_value = max(float(dataframe[x_field].max()), float(dataframe[y_field].max()), 0.0)
-    if max_value > 0:
-        axis.plot([0.0, max_value], [0.0, max_value], linestyle="--", linewidth=1.5, color="#374151")
-        axis.set_xlim(0.0, max_value * 1.02)
-        axis.set_ylim(0.0, max_value * 1.02)
-    axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel(y_label)
-    axis.grid(True, alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-    return output_path
-
-
-def _save_box_plot(
-    dataframe,
-    x_field: str,
-    y_field: str,
-    output_path: Path,
-    title: str,
-    x_label: str,
-    y_label: str,
-) -> Path:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    order = _policy_order(dataframe)
-    palette = _policy_palette(order)
-    figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
-    sns.boxenplot(
-        data=dataframe,
-        x=x_field,
-        y=y_field,
-        hue=x_field,
-        order=order,
-        hue_order=order,
-        palette=palette,
-        dodge=False,
-        legend=False,
-        ax=axis,
-    )
-    sns.stripplot(
-        data=dataframe,
-        x=x_field,
-        y=y_field,
-        order=order,
-        color="#111827",
-        alpha=0.35,
-        size=3.5,
-        ax=axis,
-    )
-    axis.set_title(title)
-    axis.set_xlabel(x_label)
-    axis.set_ylabel(y_label)
-    plt.setp(axis.get_xticklabels(), rotation=15, ha="right")
-    axis.grid(True, axis="y", alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-    return output_path
-
-
-def _save_cluster_mix_plot(dataframe, output_path: Path, title: str) -> Path:
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import PercentFormatter
-    import pandas as pd
-
-    order = _policy_order(dataframe)
-    mix = (
-        pd.crosstab(dataframe["policy"], dataframe["cluster_id"], normalize="index")
-        .reindex(order)
-        .fillna(0.0)
-    )
-    figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
-    colors = ["#2563eb", "#f59e0b", "#14b8a6", "#a855f7", "#ef4444", "#64748b"]
-    mix.plot(kind="bar", stacked=True, ax=axis, color=colors[: len(mix.columns)])
-    axis.set_title(title)
-    axis.set_xlabel("Policy")
-    axis.set_ylabel("Assignment share")
-    axis.yaxis.set_major_formatter(PercentFormatter(1.0))
-    plt.setp(axis.get_xticklabels(), rotation=15, ha="right")
-    axis.legend(title="Cluster", loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
-    axis.grid(True, axis="y", alpha=0.2)
-    figure.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-    return output_path
-
-
-def _save_failover_rate_plot(dataframe, output_path: Path, title: str) -> Path:
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import PercentFormatter
-    import seaborn as sns
-
-    order = _policy_order(dataframe)
-    rates = (
-        dataframe.assign(had_failover=dataframe["had_failover"].astype(bool))
-        .groupby("policy", observed=False)["had_failover"]
-        .mean()
-        .reindex(order)
-        .fillna(0.0)
-        .reset_index()
-    )
-    figure, axis = plt.subplots(figsize=(9, 5), dpi=150)
-    sns.barplot(
-        data=rates,
-        x="policy",
-        y="had_failover",
-        hue="policy",
-        order=order,
-        hue_order=order,
-        palette=_policy_palette(order),
-        dodge=False,
-        legend=False,
-        ax=axis,
-    )
-    axis.set_title(title)
-    axis.set_xlabel("Policy")
-    axis.set_ylabel("Failover rate")
-    axis.yaxis.set_major_formatter(PercentFormatter(1.0))
-    plt.setp(axis.get_xticklabels(), rotation=15, ha="right")
-    axis.grid(True, axis="y", alpha=0.2)
-    figure.tight_layout()
     figure.savefig(output_path, bbox_inches="tight")
     plt.close(figure)
     return output_path

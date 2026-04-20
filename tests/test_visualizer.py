@@ -78,7 +78,7 @@ class VisualizerTests(unittest.TestCase):
             self.assertEqual(report_paths, [expected_report])
             report_html = expected_report.read_text(encoding="utf-8")
             self.assertIn("Orbit Report", report_html)
-            self.assertIn("summary", report_html)
+            self.assertIn("Orbit", report_html)
             self.assertIn("Latency P50", report_html)
             self.assertIn("Predicted vs Actual Latency", report_html)
             self.assertIn("Reuse Fraction Distribution", report_html)

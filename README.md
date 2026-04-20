@@ -228,6 +228,8 @@ bash scripts/run_related_work.sh \
 
 The related-work runner generates one shared workload, replays it locally through the selected Orbit policies, then replays the same scheduled arrivals against each configured external endpoint. Each external target is treated as a black-box service, so this path is best suited to deployed systems that expose OpenAI-compatible chat or completion APIs. If a target needs a clean cache before each run, add `process.reset_command`, `process.startup_command`, or `process.shutdown_command` entries to the target config.
 
+Orbit's `vllm_prefix_mock` and `vllm_kv_mock` policies are local `vLLM`-style baselines, not imported `vLLM` router implementations. `vllm_prefix_mock` models sticky exact-prefix affinity, while `vllm_kv_mock` models block-granular KV-aware routing from exact local state.
+
 Run the mixed realistic workload with external chat, RAG, agent/tool, and bursty traffic:
 
 ```bash
@@ -323,7 +325,7 @@ The benchmark runner writes:
 - `summary_by_traffic.csv`: per-policy aggregates grouped by traffic class
 - `summary_by_source.csv`: per-policy aggregates grouped by dataset or source id
 - `report.html`: generated visualization for the run when you render it with the visualizer script
-- `plots/*.png`: seaborn-generated PNG plots such as `ttft_cdf.png`, `latency_cdf.png`, and `predicted_vs_actual_latency.png`
+- `plots/*.png`: seaborn-generated PNG plots such as `ttft_cdf.png`, `latency_cdf.png`, and `reuse_latency_tradeoff.png`
 
 Run multiple seeds and emit aggregate summaries:
 

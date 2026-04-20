@@ -238,6 +238,8 @@ class Simulation:
                         traffic_class=request.traffic_class,
                         session_id=request.session_id,
                         source_id=request.source_id,
+                        predicted_ttft=float(decision.details.get("predicted_ttft", 0.0)),
+                        predicted_route_cost=float(decision.details.get("predicted_route_cost", decision.predicted_latency)),
                     )
                 )
                 cluster_counts[decision.cluster_id] += 1
@@ -650,6 +652,11 @@ class Simulation:
             traffic_class=request_obj.traffic_class,
             session_id=request_obj.session_id,
             source_id=request_obj.source_id,
+            predicted_ttft=float(decision.details.get("predicted_ttft", 0.0)),
+            predicted_route_cost=float(decision.details.get("predicted_route_cost", decision.predicted_latency)),
+            raw_estimated_reusable_tokens=int(decision.details.get("raw_estimated_reusable_tokens", decision.estimated_reusable_tokens)),
+            summary_matched_levels=int(decision.details.get("summary_matched_levels", 0.0)),
+            hotset_matched_levels=int(decision.details.get("hotset_matched_levels", 0.0)),
         )
 
     def _summary_interval(self) -> float:

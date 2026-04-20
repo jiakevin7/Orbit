@@ -6,7 +6,7 @@ import statistics
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .calibration import fit_router_config
 from .cluster import ClusterConfig
@@ -261,9 +261,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for seed in seeds:
         config = build_simulation_config(args, seed=seed)
+        simulation_allocation_index = 0
+
+        def allocate_config(base_config: SimulationConfig) -> SimulationConfig:
+            nonlocal simulation_allocation_index
+            allocated = allocate_llama_cpp_ports(base_config, simulation_allocation_index)
+            simulation_allocation_index += 1
+            return allocated
+
         requests = generate_workload(config.workload)
         if args.backend == "llama_cpp":
-            prepare_simulation = Simulation(config)
+            prepare_simulation = Simulation(allocate_config(config))
             try:
                 requests = prepare_simulation.prepare_requests(requests)
             finally:
@@ -286,7 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         calibrated_config = config
         calibration_payload: dict[str, object] | None = None
         if args.calibrate_router:
-            calibration_simulation = Simulation(config)
+            calibration_simulation = Simulation(allocate_config(config))
             try:
                 calibration_records, _ = calibration_simulation.run(
                     policy_name=args.calibration_policy,
@@ -316,13 +324,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warmup_requests=warmup_requests,
                 validation_requests=validation_requests,
                 p95_regression_tolerance=args.validation_p95_regression_tolerance,
+                config_allocator=allocate_config,
             )
             selection_by_seed[seed] = selection_payload
             write_json(run_dir / "selection.json", selection_payload)
 
         metrics_by_policy = {}
         for policy_name in policies:
-            simulation = Simulation(selected_config)
+            simulation = Simulation(allocate_config(selected_config))
             if warmup_requests:
                 simulation.run(
                     policy_name=policy_name,
@@ -528,6 +537,19 @@ def _continuation_token_range(cap: int | None) -> tuple[int, int]:
     return (lower, upper)
 
 
+def allocate_llama_cpp_ports(config: SimulationConfig, allocation_index: int) -> SimulationConfig:
+    if config.backend != "llama_cpp" or config.llama_cpp is None:
+        return config
+    stride = max(len(config.cluster_ids) + 2, 16)
+    return replace(
+        config,
+        llama_cpp=replace(
+            config.llama_cpp,
+            port_base=config.llama_cpp.port_base + allocation_index * stride,
+        ),
+    )
+
+
 def resolve_output_dir(output_dir: str | None) -> Path:
     if output_dir:
         return Path(output_dir).resolve()
@@ -617,8 +639,9 @@ def replay_policy(
     policy_name: str,
     warmup_requests: Sequence,
     eval_requests: Sequence,
+    config_allocator: Callable[[SimulationConfig], SimulationConfig] | None = None,
 ) -> list:
-    simulation = Simulation(config)
+    simulation = Simulation(config_allocator(config) if config_allocator is not None else config)
     try:
         if warmup_requests:
             simulation.run(policy_name=policy_name, requests=warmup_requests, close_on_finish=False)
@@ -635,8 +658,15 @@ def select_config_by_validation(
     warmup_requests: Sequence,
     validation_requests: Sequence,
     p95_regression_tolerance: float,
+    config_allocator: Callable[[SimulationConfig], SimulationConfig] | None = None,
 ) -> tuple[SimulationConfig, dict[str, object]]:
-    base_records = replay_policy(base_config, calibration_policy, warmup_requests, validation_requests)
+    base_records = replay_policy(
+        base_config,
+        calibration_policy,
+        warmup_requests,
+        validation_requests,
+        config_allocator=config_allocator,
+    )
     base_validation_error = prediction_error_summary(base_records)
     base_validation_metrics = validation_metrics_summary(base_records)
 
@@ -650,7 +680,13 @@ def select_config_by_validation(
 
     cluster_overrides = dict(calibrated_config.router_config.cluster_overrides)
     if not cluster_overrides:
-        calibrated_records = replay_policy(calibrated_config, calibration_policy, warmup_requests, validation_requests)
+        calibrated_records = replay_policy(
+            calibrated_config,
+            calibration_policy,
+            warmup_requests,
+            validation_requests,
+            config_allocator=config_allocator,
+        )
         calibrated_validation_error = prediction_error_summary(calibrated_records)
         calibrated_validation_metrics = validation_metrics_summary(calibrated_records)
         accepted, reasons = validation_candidate_accepted(
@@ -675,7 +711,13 @@ def select_config_by_validation(
             base_config,
             router_config=replace(base_config.router_config, cluster_overrides={cluster_id: override}),
         )
-        cluster_records = replay_policy(cluster_candidate, calibration_policy, warmup_requests, validation_requests)
+        cluster_records = replay_policy(
+            cluster_candidate,
+            calibration_policy,
+            warmup_requests,
+            validation_requests,
+            config_allocator=config_allocator,
+        )
         cluster_error = prediction_error_summary(cluster_records)
         cluster_metrics = validation_metrics_summary(cluster_records)
         accepted, reasons = validation_candidate_accepted(
@@ -708,7 +750,13 @@ def select_config_by_validation(
         base_config,
         router_config=replace(base_config.router_config, cluster_overrides=accepted_cluster_overrides),
     )
-    canary_records = replay_policy(canary_config, calibration_policy, warmup_requests, validation_requests)
+    canary_records = replay_policy(
+        canary_config,
+        calibration_policy,
+        warmup_requests,
+        validation_requests,
+        config_allocator=config_allocator,
+    )
     canary_validation_error = prediction_error_summary(canary_records)
     canary_validation_metrics = validation_metrics_summary(canary_records)
     accepted, reasons = validation_candidate_accepted(

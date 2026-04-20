@@ -53,6 +53,7 @@ class WorkloadConfig:
     traffic_burst_probability: float = 0.15
     dataset_continuation_floor: int = 8
     dataset_continuation_cap: int = 96
+    prompt_prefix_token_cap: int | None = 4096
 
 
 @dataclass(frozen=True)
@@ -431,6 +432,7 @@ def _build_sharegpt_chat_request(
         rng=rng,
     )
     return _build_request(
+        config=config,
         request_id=f"req-{request_index:05d}",
         arrival_time=arrival_time,
         router_id=router_id,
@@ -477,6 +479,7 @@ def _build_rag_request(
         prompt_prefix_text = render_section_prompt(prompt_sections)
         continuation_seed = example.answer or " ".join(doc_text for _, doc_text in chosen_docs[:1])
         return _build_request(
+            config=config,
             request_id=f"req-{request_index:05d}",
             arrival_time=arrival_time,
             router_id=rng.choice(config.router_ids),
@@ -512,6 +515,7 @@ def _build_rag_request(
     prompt_prefix_text = render_section_prompt(prompt_sections)
     continuation_seed = " ".join(doc_text for _, doc_text in chosen_docs[:1])
     return _build_request(
+        config=config,
         request_id=f"req-{request_index:05d}",
         arrival_time=arrival_time,
         router_id=rng.choice(config.router_ids),
@@ -555,6 +559,7 @@ def _build_agent_request(
             rng=rng,
         )
         return _build_request(
+            config=config,
             request_id=f"req-{request_index:05d}",
             arrival_time=arrival_time,
             router_id=router_id,
@@ -595,6 +600,7 @@ def _build_agent_request(
     ]
     prompt_prefix_text = render_section_prompt(prompt_sections)
     return _build_request(
+        config=config,
         request_id=f"req-{request_index:05d}",
         arrival_time=arrival_time,
         router_id=router_id,
@@ -659,6 +665,7 @@ def _build_bursty_requests(
 
         requests.append(
             _build_request(
+                config=config,
                 request_id=f"req-{request_index_start + offset:05d}",
                 arrival_time=current_arrival,
                 router_id=router_id,
@@ -717,6 +724,7 @@ def _build_followup_burst_requests(
 
 
 def _build_request(
+    config: WorkloadConfig,
     request_id: str,
     arrival_time: float,
     router_id: str,
@@ -726,13 +734,17 @@ def _build_request(
     session_id: str | None = None,
     source_id: str | None = None,
 ) -> Request:
+    normalized_prompt_prefix_text = _truncate_prompt_prefix_text(
+        prompt_prefix_text,
+        config.prompt_prefix_token_cap,
+    )
     return Request(
         request_id=request_id,
         arrival_time=arrival_time,
         router_id=router_id,
-        prefix_tokens=text_to_routing_tokens(prompt_prefix_text),
+        prefix_tokens=text_to_routing_tokens(normalized_prompt_prefix_text),
         continuation_tokens=continuation_tokens,
-        prompt_prefix_text=prompt_prefix_text,
+        prompt_prefix_text=normalized_prompt_prefix_text,
         traffic_class=traffic_class,
         session_id=session_id,
         source_id=source_id,
@@ -748,6 +760,16 @@ def render_message_prompt(messages: Sequence[tuple[str, str]]) -> str:
         blocks.append(f"{_ROLE_LABELS[normalized_role]}:\n{content.strip()}")
     blocks.append("Assistant:")
     return "\n\n".join(blocks)
+
+
+def _truncate_prompt_prefix_text(prompt_prefix_text: str, token_cap: int | None) -> str:
+    if token_cap is None or token_cap <= 0:
+        return prompt_prefix_text
+    matches = list(re.finditer(r"[A-Za-z0-9_-]+|[^\w\s]", prompt_prefix_text))
+    if len(matches) <= token_cap:
+        return prompt_prefix_text
+    end_index = matches[token_cap - 1].end()
+    return prompt_prefix_text[:end_index].rstrip()
 
 
 def render_section_prompt(sections: Sequence[tuple[str, str]]) -> str:

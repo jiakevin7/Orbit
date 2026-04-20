@@ -11,9 +11,6 @@ from .models import ExecutionRecord, Request, SimulationMetrics
 
 
 EXECUTION_RECORD_FIELDS = tuple(field.name for field in fields(ExecutionRecord))
-REQUEST_FIELDS = tuple(field.name for field in fields(Request))
-
-
 def execution_records_as_dicts(records: Sequence[ExecutionRecord]) -> list[dict[str, object]]:
     return [asdict(record) for record in records]
 

@@ -50,6 +50,7 @@ class ClusterSummary:
     depths: tuple[int, ...]
     filters: Dict[int, BloomFilter]
     byte_size: int
+    hot_prefix_hashes: Dict[int, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,11 @@ class ExecutionRecord:
     traffic_class: str = "synthetic"
     session_id: str | None = None
     source_id: str | None = None
+    predicted_ttft: float = 0.0
+    predicted_route_cost: float = 0.0
+    raw_estimated_reusable_tokens: int = 0
+    summary_matched_levels: int = 0
+    hotset_matched_levels: int = 0
 
 
 @dataclass(frozen=True)

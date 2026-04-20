@@ -17,6 +17,14 @@ SUMMARY_FIELDS = (
     "failover_rate",
 )
 
+POLICY_DISPLAY_NAMES = {
+    "orbit": "Orbit",
+    "summary": "Orbit",
+    "least_loaded": "Least Loaded",
+    "load_only": "Least Loaded",
+    "round_robin": "Round Robin",
+}
+
 
 def generate_reports(run_dir: str | Path, recursive: bool = True) -> list[Path]:
     root = Path(run_dir).resolve()
@@ -295,7 +303,7 @@ def _plot_images(run_dir: Path) -> list[str]:
 def _render_policy_cards(summary_rows: Sequence[Mapping[str, object]]) -> str:
     cards = ["<div class='policy-grid'>"]
     for row in summary_rows:
-        policy = html.escape(str(row.get("policy", "unknown")))
+        policy = html.escape(_display_policy_name(str(row.get("policy", "unknown"))))
         cards.append("<article class='card'>")
         cards.append(f"<h3>{policy}</h3>")
         cards.append("<dl>")
@@ -329,7 +337,7 @@ def _render_metric_chart(summary_rows: Sequence[Mapping[str, object]], field: st
     ]
     for index, row in enumerate(summary_rows):
         y = 12 + index * (bar_height + gap)
-        policy = html.escape(str(row.get("policy", "unknown")))
+        policy = html.escape(_display_policy_name(str(row.get("policy", "unknown"))))
         value = max(0.0, _to_float(row.get(field)))
         width = 0.0 if maximum <= 0 else (value / maximum) * bar_width
         lines.append(f"<text x='0' y='{y + 17}' class='axis-label'>{policy}</text>")
@@ -410,7 +418,7 @@ def _render_grouped_bar_chart(
             lines.append(
                 f"<rect x='{x:.2f}' y='{y:.2f}' width='{bar_width:.2f}' height='{current_bar_height:.2f}' "
                 f"rx='4' fill='{color}'>"
-                f"<title>{html.escape(policy)} / {html.escape(group)}: {html.escape(_format_value(value))}</title>"
+                f"<title>{html.escape(_display_policy_name(policy))} / {html.escape(group)}: {html.escape(_format_value(value))}</title>"
                 "</rect>"
             )
         label_x = group_x + (used_width / 2.0)
@@ -421,7 +429,7 @@ def _render_grouped_bar_chart(
         color = _series_color(policy_index)
         entry_x = legend_x + policy_index * 160
         lines.append(f"<rect x='{entry_x}' y='4' width='14' height='14' rx='3' fill='{color}' />")
-        lines.append(f"<text x='{entry_x + 20}' y='15' class='legend'>{html.escape(policy)}</text>")
+        lines.append(f"<text x='{entry_x + 20}' y='15' class='legend'>{html.escape(_display_policy_name(policy))}</text>")
 
     lines.extend(["</svg>", "</div>"])
     return "\n".join(lines)
@@ -446,7 +454,12 @@ def _render_table(rows: Sequence[Mapping[str, object]], columns: Sequence[str] |
     for row in rows:
         parts.append("<tr>")
         for column in ordered_columns:
-            parts.append(f"<td>{html.escape(_format_value(row.get(column)))}</td>")
+            value = row.get(column)
+            if column == "policy" and value is not None:
+                formatted = _display_policy_name(str(value))
+            else:
+                formatted = _format_value(value)
+            parts.append(f"<td>{html.escape(formatted)}</td>")
         parts.append("</tr>")
     parts.append("</tbody></table></div>")
     return "\n".join(parts)
@@ -484,8 +497,8 @@ def _render_trace_chart(records: Sequence[Mapping[str, object]], policy_name: st
 
     lines = [
         "<div class='chart'>",
-        f"<h3>{html.escape(policy_name)} request trace</h3>",
-        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(policy_name)} request trace'>",
+        f"<h3>{html.escape(_display_policy_name(policy_name))} request trace</h3>",
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(_display_policy_name(policy_name))} request trace'>",
         f"<line x1='{left_pad}' y1='{top_pad + chart_height}' x2='{width - right_pad}' y2='{top_pad + chart_height}' class='axis' />",
         f"<line x1='{left_pad}' y1='{top_pad}' x2='{left_pad}' y2='{top_pad + chart_height}' class='axis' />",
     ]
@@ -741,6 +754,10 @@ def _flatten_mapping(prefix: str, mapping: Mapping[str, object]) -> list[tuple[s
 
 def _prettify_name(name: str) -> str:
     return name.replace("_", " ").title()
+
+
+def _display_policy_name(policy_name: str) -> str:
+    return POLICY_DISPLAY_NAMES.get(policy_name, policy_name.replace("_", " ").title())
 
 
 def _short_label(label: str, max_length: int = 18) -> str:

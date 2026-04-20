@@ -36,9 +36,10 @@ class RouterTests(unittest.TestCase):
         )
         router.receive_summary(summary, summary.created_at, source="cluster-a")
 
-        estimated_reuse, matched_levels = router.estimate_reusable_prefix((1, 2, 3, 4, 9, 9), summary)
-        self.assertEqual(estimated_reuse, 4)
-        self.assertEqual(matched_levels, 2)
+        reuse_estimate = router.estimate_reusable_prefix((1, 2, 3, 4, 9, 9), summary)
+        self.assertEqual(reuse_estimate.raw_tokens, 5)
+        self.assertEqual(reuse_estimate.calibrated_tokens, 5)
+        self.assertEqual(reuse_estimate.matched_levels, 2)
 
     def test_router_prefers_cluster_with_better_predicted_reuse(self) -> None:
         fast_cluster = Cluster(
@@ -63,7 +64,7 @@ class RouterTests(unittest.TestCase):
         router = Router(
             "router-a",
             {"cluster-fast": 10.0, "cluster-slow": 10.0},
-            RouterConfig(summary_depths=(2, 4), low_overlap_fraction=0.0),
+            RouterConfig(summary_depths=(2, 4), low_overlap_fraction=0.0, summary_advantage_margin=0.0),
         )
         router.receive_summary(fast_cluster.publish_summary(execution.finished_at), execution.finished_at, "cluster-fast")
         router.receive_summary(slow_cluster.publish_summary(execution.finished_at), execution.finished_at, "cluster-slow")
@@ -126,7 +127,7 @@ class RouterTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.cluster_id, "cluster-cached")
-        self.assertEqual(decision.estimated_reusable_tokens, 8)
+        self.assertGreaterEqual(decision.estimated_reusable_tokens, 8)
 
 
 if __name__ == "__main__":

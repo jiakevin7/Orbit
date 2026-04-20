@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from .bloom import BloomFilter
-from .hashing import hash_prefix
+from .hashing import hash_prefix, hot_prefix_hashes
 from .models import ClusterExecution, ClusterSummary, Request
 from .trie import PrefixTrie
 
@@ -15,7 +15,9 @@ from .trie import PrefixTrie
 class ClusterConfig:
     cache_capacity: int = 256
     cache_capacity_tokens: int | None = None
-    summary_depths: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512)
+    summary_depths: tuple[int, ...] = (4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 192, 256, 384, 512)
+    hotset_depths: tuple[int, ...] = (4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48)
+    hotset_capacity_per_depth: int = 512
     bloom_bits: int = 16384
     bloom_hashes: int = 5
     summary_interval: float = 5.0
@@ -108,8 +110,16 @@ class Cluster:
                 if len(tokens) >= depth:
                     filters[depth].add(hash_prefix(tokens, depth))
 
+        hotsets = hot_prefix_hashes(
+            self._cache.values(),
+            self.config.hotset_depths,
+            self.config.hotset_capacity_per_depth,
+        )
+
         self._summary_version += 1
-        byte_size = sum(bloom.byte_size for bloom in filters.values()) + 64
+        byte_size = sum(bloom.byte_size for bloom in filters.values()) + sum(
+            8 * len(values) for values in hotsets.values()
+        ) + 64
         return ClusterSummary(
             cluster_id=self.cluster_id,
             version=self._summary_version,
@@ -118,6 +128,7 @@ class Cluster:
             depths=self.config.summary_depths,
             filters=filters,
             byte_size=byte_size,
+            hot_prefix_hashes=hotsets,
         )
 
     def _insert_into_cache(self, request_id: str, tokens: tuple[int, ...]) -> None:

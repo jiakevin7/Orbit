@@ -42,6 +42,37 @@ class WorkloadTests(unittest.TestCase):
                 text_to_routing_tokens(request.prompt_prefix_text or ""),
             )
 
+    def test_prompt_prefix_token_cap_truncates_oversized_prompts(self) -> None:
+        sharegpt_payload = [
+            {
+                "id": "long-conv",
+                "conversations": [
+                    {"from": "human", "value": " ".join(f"token{i}" for i in range(200))},
+                    {"from": "gpt", "value": "brief reply"},
+                ],
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "sharegpt.json"
+            dataset_path.write_text(json.dumps(sharegpt_payload), encoding="utf-8")
+            requests = generate_workload(
+                WorkloadConfig(
+                    num_requests=1,
+                    workload_kind="mixed_realistic",
+                    sharegpt_path=str(dataset_path),
+                    traffic_mix_chat=1.0,
+                    traffic_mix_rag=0.0,
+                    traffic_mix_agent=0.0,
+                    traffic_mix_bursty=0.0,
+                    prompt_prefix_token_cap=32,
+                    seed=5,
+                )
+            )
+
+        self.assertEqual(len(requests), 1)
+        self.assertLessEqual(len(requests[0].prefix_tokens), 32)
+
     def test_mixed_realistic_workload_covers_all_supported_traffic_classes(self) -> None:
         sharegpt_payload = [
             {

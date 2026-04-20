@@ -14,7 +14,7 @@ from urllib import request
 
 from .bloom import BloomFilter
 from .cluster import ClusterConfig
-from .hashing import hash_prefix
+from .hashing import hash_prefix, hot_prefix_hashes
 from .models import ClusterExecution, ClusterSummary, Request
 from .trie import PrefixTrie
 
@@ -454,9 +454,17 @@ class LlamaCppCluster:
                     if len(tokens) >= depth:
                         filters[depth].add(hash_prefix(tokens, depth))
 
+            hotsets = hot_prefix_hashes(
+                self._cache.values(),
+                self.cluster_config.hotset_depths,
+                self.cluster_config.hotset_capacity_per_depth,
+            )
+
             self._summary_version += 1
             version = self._summary_version
-            byte_size = sum(bloom.byte_size for bloom in filters.values()) + 64
+            byte_size = sum(bloom.byte_size for bloom in filters.values()) + sum(
+                8 * len(values) for values in hotsets.values()
+            ) + 64
 
         return ClusterSummary(
             cluster_id=self.cluster_id,
@@ -466,6 +474,7 @@ class LlamaCppCluster:
             depths=self.cluster_config.summary_depths,
             filters=filters,
             byte_size=byte_size,
+            hot_prefix_hashes=hotsets,
         )
 
     def close(self) -> None:
