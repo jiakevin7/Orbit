@@ -1,11 +1,6 @@
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass, field
-from typing import Dict
-
 from .bloom import BloomFilter
-
 
 @dataclass(frozen=True)
 class Request:
@@ -15,31 +10,25 @@ class Request:
     prefix_tokens: tuple[int, ...]
     continuation_tokens: int = 32
     prompt_prefix_text: str | None = None
-    prefix_token_source: str = "synthetic_lexical"
+    prefix_token_source: str = 'synthetic_lexical'
     arrival_scale_applied: float = 1.0
-    traffic_class: str = "synthetic"
+    traffic_class: str = 'synthetic'
     session_id: str | None = None
     source_id: str | None = None
 
     @property
-    def input_length(self) -> int:
+    def input_length(self):
         return len(self.prefix_tokens)
 
     @property
-    def prompt_text(self) -> str:
+    def prompt_text(self):
         if self.prompt_prefix_text is not None:
             normalized = self.prompt_prefix_text.rstrip()
-            if re.search(r"assistant:\s*$", normalized, re.IGNORECASE):
+            if re.search('assistant:\\s*$', normalized, re.IGNORECASE):
                 return normalized
-            return f"{normalized}\nAssistant:"
-        token_text = " ".join(f"tok_{token}" for token in self.prefix_tokens)
-        return (
-            "You are participating in a routing benchmark.\n"
-            "Treat the following prefix as reusable context.\n"
-            f"{token_text}\n"
-            "Assistant:"
-        )
-
+            return f'{normalized}\nAssistant:'
+        token_text = ' '.join((f'tok_{token}' for token in self.prefix_tokens))
+        return f'You are participating in a routing benchmark.\nTreat the following prefix as reusable context.\n{token_text}\nAssistant:'
 
 @dataclass(frozen=True)
 class ClusterSummary:
@@ -48,10 +37,9 @@ class ClusterSummary:
     created_at: float
     queue_depth: int
     depths: tuple[int, ...]
-    filters: Dict[int, BloomFilter]
+    filters: dict[int, BloomFilter]
     byte_size: int
-    hot_prefix_hashes: Dict[int, tuple[int, ...]] = field(default_factory=dict)
-
+    hot_prefix_hashes: dict[int, tuple[int, ...]] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class ClusterExecution:
@@ -65,7 +53,6 @@ class ClusterExecution:
     time_to_first_token: float
     cache_ready_at: float
 
-
 @dataclass(frozen=True)
 class RouteDecision:
     policy: str
@@ -73,8 +60,7 @@ class RouteDecision:
     estimated_reusable_tokens: int
     predicted_latency: float
     used_fallback: bool = False
-    details: Dict[str, float] = field(default_factory=dict)
-
+    details: dict[str, float] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class ExecutionRecord:
@@ -106,7 +92,7 @@ class ExecutionRecord:
     failover_delay: float
     attempt_count: int
     service_time: float
-    traffic_class: str = "synthetic"
+    traffic_class: str = 'synthetic'
     session_id: str | None = None
     source_id: str | None = None
     predicted_ttft: float = 0.0
@@ -114,7 +100,6 @@ class ExecutionRecord:
     raw_estimated_reusable_tokens: int = 0
     summary_matched_levels: int = 0
     hotset_matched_levels: int = 0
-
 
 @dataclass(frozen=True)
 class SimulationMetrics:
@@ -131,4 +116,4 @@ class SimulationMetrics:
     load_stddev: float
     failover_count: int
     failover_rate: float
-    cluster_request_counts: Dict[str, int]
+    cluster_request_counts: dict[str, int]

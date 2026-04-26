@@ -3,8 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-default_model="$repo_root/models/qwen2.5-3b-instruct-q4_k_m.gguf"
-model_path="${ORBIT_MODEL_PATH:-${ORBIT_LIVE_TEST_MODEL:-$default_model}}"
+model_path="$repo_root/models/qwen2.5-3b-instruct-q4_k_m.gguf"
 
 if [[ ! -f "$model_path" ]]; then
   echo "live model not found: $model_path" >&2
@@ -13,7 +12,7 @@ if [[ ! -f "$model_path" ]]; then
 fi
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
-output_dir="${ORBIT_OUTPUT_DIR:-results/live-benchmark-${timestamp}}"
+output_dir="results/orbit-live-${timestamp}"
 args=("$@")
 
 for ((index = 0; index < ${#args[@]}; index++)); do
@@ -30,16 +29,7 @@ for ((index = 0; index < ${#args[@]}; index++)); do
 done
 
 python3 scripts/benchmark_policies.py \
-  --backend llama_cpp \
   --model "$model_path" \
-  --workload-kind "${ORBIT_WORKLOAD_KIND:-mixed_realistic}" \
-  --requests "${ORBIT_REQUESTS:-20}" \
-  --warmup-requests "${ORBIT_WARMUP_REQUESTS:-8}" \
-  --validation-requests "${ORBIT_VALIDATION_REQUESTS:-4}" \
-  --routers "${ORBIT_ROUTERS:-2}" \
-  --clusters "${ORBIT_CLUSTERS:-2}" \
-  --live-arrival-scale "${ORBIT_LIVE_ARRIVAL_SCALE:-0.01}" \
-  --calibrate-router \
   --output-dir "$output_dir" \
   "${args[@]}"
 
