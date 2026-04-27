@@ -1,228 +1,275 @@
 # Orbit
 
-Semantic-aware KV-cache affinity routing layer for LLM serving.
+Orbit is a cluster-level, prefix-aware router for multi-cluster LLM serving. It routes each request to a reachable cluster by estimating where the largest reusable leading prompt prefix is likely cached, then combining that prefix-reuse estimate with visible load, summary staleness, and router-to-cluster network cost.
 
-Orbit is a request router that steers inference traffic toward replicas that already hold relevant KV-cache state, reducing redundant prefill computation. It uses a two-stage approach: a fast semantic pre-filter narrows candidates, then exact token-level prefix matching selects the best replica.
-
-## Architecture
-
-```
-                    ┌─────────────────┐
-   Clients ──────►  │  Orbit Router   │  (cache-affinity + load-aware routing)
-                    │  :8000          │
-                    └────┬───┬───┬────┘
-                         │   │   │
-              ┌──────────┘   │   └──────────┐
-              ▼              ▼              ▼
-        ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │ Replica 1│  │ Replica 2│  │ Replica 3│  ... (N replicas)
-        │ :8001    │  │ :8002    │  │ :8003    │
-        └──────────┘  └──────────┘  └──────────┘
-              ▲              ▲              ▲
-              └──────────┬───┴──────────────┘
-                         │
-                    ┌────┴────┐
-                    │ Monitor │  (polls replica load)
-                    │ :8080   │
-                    └─────────┘
-```
-
-All components communicate over HTTP/JSON on a Docker bridge network.
-
-## How It Works
-
-### Two-Stage Routing
-
-**Stage 1 — Semantic Pre-Filter** (fast, approximate)
-1. Parse the prompt into segments (system prompt, tools, RAG context, user query)
-2. Embed the stable segments (system prompt, tools) with MiniLM
-3. Cosine similarity against embeddings of cached prefix segments
-4. Return top-k candidate replicas likely to hold relevant KV-cache state
-
-**Stage 2 — Exact Match + Scoring** (correct, decisive)
-1. Tokenize the full prompt and compute chained SHA-256 block hashes (16-token blocks)
-2. For each candidate replica, look up the prefix trie for the longest exact block-hash match
-3. Score each candidate: `score = α · (cached_tokens / total_tokens) - β · normalized_congestion`
-4. Select the highest-scoring replica (fallback: least-loaded if no cache overlap)
-
-The semantic layer only narrows the search — it never bypasses hash verification. Only exact token-level prefix matches count.
-
-### Simulated Backend
-
-Since Docker on macOS cannot pass through GPUs, replicas use a simulated LLM backend that models realistic timing:
-
-```
-prefill_ms = 0.5ms × (total_prompt_tokens - cached_prefix_tokens)
-decode_ms  = 10ms  × output_tokens
-queue_wait = FIFO queue with max_concurrent limit (default: 4)
-```
-
-The simulated KV cache uses LRU eviction over fixed-size blocks (default: 1000 blocks of 16 tokens).
-
-## Project Structure
-
-```
-orbit/
-├── common/           # Shared code
-│   ├── schemas.py    # Pydantic models (requests, responses, cache updates)
-│   ├── hashing.py    # SHA-256 chained block hashing over token sequences
-│   └── config.py     # Env-var-driven configuration
-├── router/           # Routing service
-│   ├── app.py              # FastAPI entrypoint (:8000)
-│   ├── routing_engine.py   # Core pipeline: parse → filter → match → score → route
-│   ├── prompt_analyzer.py  # Segment, tokenize, and hash chat messages
-│   ├── prefix_trie.py      # Radix trie: block hashes → replicas
-│   ├── semantic_index.py   # MiniLM embedding search for candidate pre-filtering
-│   ├── cache_registry.py   # Bidirectional index (replica ↔ block hashes)
-│   ├── scorer.py           # α·prefill_savings - β·congestion scoring
-│   └── load_tracker.py     # Per-replica load state
-├── replica/          # Simulated LLM replicas
-│   ├── app.py              # FastAPI entrypoint (:8001)
-│   ├── sim_backend.py      # Timing model + concurrency queue
-│   ├── kv_cache.py         # Block-level KV cache with LRU eviction
-│   └── backend_interface.py
-├── monitor/          # Load collector
-│   ├── app.py              # FastAPI entrypoint (:8080)
-│   └── collector.py        # Polls replicas, pushes load to router
-└── bench/            # Benchmarking
-    ├── runner.py           # Async benchmark runner
-    ├── workloads.py        # Chat, RAG, agentic, mixed generators
-    ├── baselines.py        # Round-robin, random, hash-based, least-loaded
-    └── analysis.py         # Metrics (TTFT CDFs, cache hit rates) + plotting
-```
+The repository is configured around one reproducible benchmark: mixed external chat/RAG/agent traffic replayed through a live `llama.cpp` backend. The maintained routing policies are `orbit`, `least_loaded`, `random`, and `round_robin`.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.11+
-- Docker & Docker Compose
-
-### Local Development
+From the repository root:
 
 ```bash
-# Create virtualenv and install dependencies
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
+python3 -m pip install --upgrade pip
+python3 -m pip install -e ".[plots,dev]"
 ```
 
-### Docker
+Install `llama.cpp` so `llama-server` is on `PATH`.
 
 ```bash
-# Start all services (router + 4 replicas + monitor)
-docker compose up -d
-
-# Check health
-curl http://localhost:8000/health
-
-# Send a request through the router
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "What is Python?"}
-    ],
-    "max_tokens": 64
-  }'
-
-# Advisory mode (returns routing decision without forwarding)
-curl -X POST http://localhost:8000/v1/route \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "What is Python?"}
-    ]
-  }'
-
-# Stop services
-docker compose down
+brew install llama.cpp
+llama-server --help
 ```
 
-### Benchmarking
+Download the default GGUF model into the expected path:
 
 ```bash
-# Run a benchmark (workload, num_requests, arrival_rate)
-./scripts/run_benchmark.sh chat 200 20.0
-
-# Available workloads: chat, rag, agentic, mixed
-./scripts/run_benchmark.sh rag 200 15.0
-./scripts/run_benchmark.sh mixed 300 15.0
+mkdir -p models
+curl -L \
+  -o models/qwen2.5-3b-instruct-q4_k_m.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf
 ```
 
-Results are saved to `results/` as JSON files. The analysis module can generate TTFT CDF plots and cache hit rate comparisons.
-
-## API Endpoints
-
-### Router (`:8000`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/chat/completions` | Active routing — routes and proxies to best replica |
-| POST | `/v1/route` | Advisory — returns `RoutingDecision` without forwarding |
-| POST | `/v1/cache/update` | Receive cache insert/evict updates from replicas |
-| POST | `/v1/load/update` | Receive load updates from monitor |
-| GET | `/v1/status` | Router status (replicas, load) |
-| GET | `/health` | Health check |
-
-### Replica (`:8001`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/chat/completions` | Run simulated inference |
-| GET | `/v1/status` | Replica status (load, cache utilization) |
-| GET | `/v1/cache/blocks` | List all cached block hashes |
-
-### Monitor (`:8080`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/status` | Latest collected status from all replicas |
-| GET | `/health` | Health check |
-
-## Configuration
-
-All configuration is driven by environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ORBIT_ALPHA` | `1.0` | Weight for prefill savings in scoring |
-| `ORBIT_BETA` | `0.5` | Weight for congestion penalty in scoring |
-| `ORBIT_BLOCK_SIZE` | `16` | Tokens per KV-cache block |
-| `ORBIT_CACHE_CAPACITY` | `1000` | Max blocks per replica cache |
-| `ORBIT_MAX_CONCURRENT` | `4` | Max concurrent requests per replica |
-| `ORBIT_PREFILL_MS` | `0.5` | Simulated prefill time per token (ms) |
-| `ORBIT_DECODE_MS` | `10.0` | Simulated decode time per token (ms) |
-| `ORBIT_TOKENIZER` | `cl100k_base` | Tokenizer (must match across all components) |
-| `ORBIT_STRONG_HIT_THRESHOLD` | `0.9` | Cache overlap fraction to trigger strong-hit override |
-| `ORBIT_POLL_INTERVAL` | `1.0` | Monitor polling interval (seconds) |
-
-## Technology Choices
-
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| Language | Python 3.11+ | LLM ecosystem standard |
-| Framework | FastAPI + uvicorn | Async-native, OpenAI-compatible API |
-| Semantic similarity | `all-MiniLM-L6-v2` (384-dim) | Fast on CPU, used only as pre-filter |
-| Prefix hashing | SHA-256 chained 16-token blocks | Matches vLLM conventions, collision-resistant |
-| Tokenizer | tiktoken `cl100k_base` | Consistent across router + replicas |
-| Orchestration | Docker Compose | Single command brings up the full system |
-| Testing | pytest + pytest-asyncio | 53 tests covering unit, integration, and e2e |
-
-## Tests
+Run the default benchmark and generate plots:
 
 ```bash
-pytest tests/ -v
+bash scripts/run_benchmark_live.sh --output-dir results/orbit-default
 ```
 
-- `test_hashing.py` — Block hash chaining, prefix stability, determinism
-- `test_prefix_trie.py` — Trie insert/lookup/remove, multi-replica tracking
-- `test_scorer.py` — Scoring arithmetic, load penalties, strong-hit override
-- `test_routing_engine.py` — Cache affinity, fallback behavior, convergence
-- `test_sim_backend.py` — KV cache LRU, simulated timing, concurrency limits
-- `test_integration.py` — End-to-end replica requests, cache hit verification
+The script runs `scripts/benchmark_policies.py` and then `scripts/visualize_run.py`. Outputs are written under the selected `results/` directory.
+
+## Required Inputs
+
+### Model
+
+The default benchmark expects:
+
+```text
+models/qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+This is the Qwen2.5 3B Instruct Q4_K_M GGUF model from Hugging Face. The file is about 2.1 GB. You can also use another GGUF model by calling the Python runner directly:
+
+```bash
+python3 scripts/benchmark_policies.py \
+  --model /absolute/path/to/model.gguf \
+  --output-dir results/orbit-custom-model
+```
+
+### External Datasets
+
+The default mixed workload expects three prepared dataset files under `results/external-datasets-20260418/`:
+
+```text
+results/external-datasets-20260418/sharegpt_x_chat.json
+results/external-datasets-20260418/ragbench_hotpotqa.json
+results/external-datasets-20260418/toolbench_g123_query.json
+```
+
+These represent the three traffic classes used in the final evaluation:
+
+- `sharegpt_chat`: multi-turn chat traffic
+- `rag`: retrieval-augmented generation prompts
+- `agent`: tool-use / agentic prompts
+
+If those files are not included with your copy of the project, create that directory and place compatible JSON/JSONL datasets at those paths. Alternatively, pass your own paths to `scripts/benchmark_policies.py` with `--sharegpt-path`, `--rag-path`, and `--agent-path`.
+
+## Default Benchmark Configuration
+
+`scripts/benchmark_policies.py`, `python -m orbit`, and `scripts/run_benchmark_live.sh` default to:
+
+- Backend: `llama_cpp`
+- Model: `models/qwen2.5-3b-instruct-q4_k_m.gguf`
+- Workload: mixed external chat/RAG/agent traffic
+- Traffic mix: `43.75%` chat, `31.25%` RAG, `25%` agent, `0%` standalone bursty traffic
+- Topology: `4` routers, `6` clusters, sparse overlap, `3` reachable clusters per router
+- Requests per seed: `24` warmup, `120` measured
+- Seeds: `7 11 17 23 29`
+- Policies: `orbit`, `least_loaded`, `random`, `round_robin`
+- Cache token capacity: `4096`
+- Live arrival scale: `0.01`
+
+Warmup requests are replayed before each measured policy run so caches and summaries are populated. There is no calibration or validation-selection phase in the current code path.
+
+## Runtime Expectations
+
+Runtime depends heavily on hardware, `llama.cpp` build options, and the selected GGUF model.
+
+- Environment setup and model download: usually `5-20` minutes, dominated by the roughly 2.1 GB model download.
+- Synthetic smoke test: usually under `1` minute.
+- Unit tests: usually under `1` minute.
+- Full default live benchmark: expect roughly `45-90` minutes on a high-end Apple Silicon laptop or workstation-class CPU. Slower laptops can take several hours.
+- Plot generation after benchmark completion: usually `1-3` minutes.
+
+If you only want to verify installation, run the synthetic smoke test first. Use the full live benchmark only after `llama-server --help` works and the model file exists.
+
+## Running Benchmarks
+
+Run the full default live benchmark:
+
+```bash
+bash scripts/run_benchmark_live.sh --output-dir results/orbit-default
+```
+
+Run the Python entrypoint directly:
+
+```bash
+python3 scripts/benchmark_policies.py --output-dir results/orbit-default
+```
+
+Run via the package entrypoint:
+
+```bash
+python3 -m orbit --output-dir results/orbit-default
+```
+
+Run a short synthetic smoke test that does not require `llama-server` or a GGUF model:
+
+```bash
+python3 scripts/benchmark_policies.py \
+  --backend synthetic \
+  --requests 16 \
+  --warmup-requests 4 \
+  --seeds 7 \
+  --output-dir results/orbit-smoke
+```
+
+The public help intentionally shows only the main reproducibility knobs:
+
+```bash
+python3 scripts/benchmark_policies.py --help
+```
+
+Most experiment parameters still exist for internal sensitivity checks, but the default configuration is the expected path for reproducing the report figures.
+
+## Generated Artifacts
+
+Each run directory contains:
+
+- `manifest.json`: exact benchmark settings
+- `workload.json`: full generated workload after any backend tokenization
+- `warmup_workload.json`: cache warmup requests
+- `measured_workload.json` and `test_workload.json`: measured requests
+- `<policy>_records.json` and/or `<policy>_records.csv`: per-request traces
+- `summary.json` and `summary.csv`: per-policy metrics for a single-seed run
+- `summary_by_traffic.csv`: metrics grouped by traffic class
+- `summary_by_source.csv`: metrics grouped by source dataset/session
+
+For multi-seed runs, the top-level output directory also contains:
+
+- `summary_runs.json` and `summary_runs.csv`
+- `summary_aggregate.json` and `summary_aggregate.csv`
+- `summary_by_traffic_runs.csv`
+- `summary_by_traffic_aggregate.csv`
+- `summary_by_source_runs.csv`
+- `summary_by_source_aggregate.csv`
+
+## Plotting
+
+Generate or refresh PNG plots for a benchmark directory:
+
+```bash
+python3 scripts/visualize_run.py results/orbit-default
+```
+
+Plots are written to `plots/` inside the run directory. For multi-seed runs, the visualizer also refreshes each `seed-*` subdirectory.
+
+Curated figures include:
+
+- `orbit_01_ttft_p50.png`
+- `orbit_02_reuse_fraction.png`
+- `orbit_03_reusable_prefix_by_traffic.png`
+- `orbit_04_latency_vs_reuse.png`
+- `orbit_combined.png`
+- `ttft_cdf.png`
+- `latency_cdf.png`
+- `ttft_by_policy.png`
+- `latency_by_policy.png`
+- `reuse_latency_tradeoff.png`
+- `latency_by_traffic.png`
+- `reuse_by_traffic.png`
+
+To collect plots for a report, copy the generated files from:
+
+```text
+results/<run-name>/plots/
+results/<run-name>/seed-*/plots/
+```
+
+## Testing
+
+Run the unit suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Or use the project script:
+
+```bash
+bash scripts/run_ci_checks.sh --unit-only
+```
+
+The live llama.cpp integration test is opt-in because it starts local model servers:
+
+```bash
+ORBIT_RUN_LIVE_TESTS=1 \
+ORBIT_LIVE_TEST_MODEL=models/qwen2.5-3b-instruct-q4_k_m.gguf \
+python3 -m unittest tests.test_live_llamacpp_integration -v
+```
+
+## How Orbit Works
+
+Clusters maintain exact local prefix state in a trie. Periodically, each cluster publishes a compact hierarchical summary containing Bloom filters and short-prefix hotsets. Routers receive these summaries directly or through gossip and route only among clusters reachable under the sparse topology.
+
+Orbit estimates reusable prefix length from summary matches, then evaluates a TTFT-heavy route cost:
+
+```text
+TTFT = RTT + b0 + bq*q + bp*p + ba*a + bu*u + bm*1[missing_summary]
+Latency = TTFT + bd*c
+RouteCost = TTFT + w*(Latency - TTFT)
+```
+
+Where:
+
+- `RTT` is router-to-cluster network cost.
+- `q` is visible queue depth from the latest summary.
+- `p` is remaining prefill tokens after estimated prefix reuse.
+- `a` is summary age.
+- `u` is prefix-reuse uncertainty from summary granularity.
+- `c` is continuation-token budget.
+
+The router only takes a prefix-aware route when the summary evidence is fresh and strong enough to beat the least-loaded fallback by a configured margin.
+
+## Project Layout
+
+- `orbit/router.py`: Orbit route scoring, prefix-reuse estimation, and least-loaded fallback
+- `orbit/cluster.py`: synthetic cluster cache, trie-backed prefix state, and summary publication
+- `orbit/llamacpp.py`: live `llama-server` process management, tokenization, and TTFT measurement
+- `orbit/simulation.py`: in-process and live replay simulation loop
+- `orbit/policies.py`: four maintained policies: `orbit`, `least_loaded`, `random`, `round_robin`
+- `orbit/workload.py`: synthetic and mixed external workload generation
+- `orbit/benchmark.py`: benchmark CLI, artifact export, multi-seed aggregation
+- `orbit/png_plots.py`: seaborn/matplotlib PNG figure generation
+- `orbit/reporting.py`: CSV/JSON serialization and grouped summaries
+- `orbit/bloom.py`: Bloom filter implementation for summaries
+- `orbit/hashing.py`: prefix hashing and hotset helpers
+- `orbit/trie.py`: exact prefix trie used by clusters
+- `orbit/models.py`: request, decision, record, and metric dataclasses
+- `orbit/process_plane.py`: multiprocessing proxies for control-plane isolation tests
+- `scripts/benchmark_policies.py`: thin CLI wrapper for `orbit.benchmark`
+- `scripts/run_benchmark_live.sh`: default live benchmark plus plot generation
+- `scripts/visualize_run.py`: refresh PNG plots for an existing run
+- `scripts/run_ci_checks.sh`: unit and optional live integration test runner
+
+## Expected Result Shape
+
+A successful full run should produce one top-level result directory with aggregate metrics and one `seed-*` subdirectory per seed. The exact latency values will vary by machine, `llama.cpp` build, model file, and background load. In the reference run used for the project report, the aggregate metrics had this shape:
+
+- Orbit: `ttft_p50_mean=0.561`, `latency_p50_mean=2.509`, `mean_reusable_prefix_mean=100.08`
+- Least-Loaded: `3.175`, `5.011`, `77.62`
+- Random: `3.349`, `5.618`, `75.22`
+- Round-Robin: `8.832`, `11.868`, `60.57`
+
+The main result is that approximate hierarchical prefix summaries can improve both TTFT and prefix reuse over standard practical baselines on sparse multi-cluster LLM traffic, without requiring exact global KV-cache state.

@@ -1,0 +1,48 @@
+from pathlib import Path
+
+
+# Defaults mirror the final benchmark manifest so `python -m orbit` reproduces
+# the current research run without a separate config file.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_BACKEND = "llama_cpp"
+DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf"
+
+DEFAULT_SHAREGPT_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "sharegpt_x_chat.json"
+)
+DEFAULT_RAG_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "ragbench_hotpotqa.json"
+)
+DEFAULT_AGENT_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "toolbench_g123_query.json"
+)
+
+DEFAULT_POLICIES = ("orbit", "least_loaded", "random", "round_robin")
+DEFAULT_SEEDS = (7, 11, 17, 23, 29)
+
+DEFAULT_TOTAL_REQUESTS = 144
+DEFAULT_WARMUP_REQUESTS = 24
+
+DEFAULT_ROUTER_COUNT = 4
+DEFAULT_CLUSTER_COUNT = 6
+DEFAULT_TOPOLOGY_MODE = "sparse_overlap"
+DEFAULT_REACHABLE_CLUSTERS_PER_ROUTER = 3
+
+DEFAULT_WORKLOAD_KIND = "mixed_realistic"
+DEFAULT_TRAFFIC_MIX_CHAT = 0.4375
+DEFAULT_TRAFFIC_MIX_RAG = 0.3125
+DEFAULT_TRAFFIC_MIX_AGENT = 0.25
+DEFAULT_TRAFFIC_MIX_BURSTY = 0.0
+
+DEFAULT_CACHE_CAPACITY = 256
+DEFAULT_CACHE_TOKEN_CAPACITY = 4096
+
+DEFAULT_LLAMA_EXECUTABLE = "llama-server"
+DEFAULT_LLAMA_PORT_BASE = 8081
+DEFAULT_LLAMA_THREADS = 4
+DEFAULT_LLAMA_CTX_SIZE = 4096
+DEFAULT_LLAMA_PARALLEL = 1
+DEFAULT_LLAMA_TIMEOUT = 120.0
+DEFAULT_LLAMA_STARTUP_TIMEOUT = 120.0
+DEFAULT_LIVE_ARRIVAL_SCALE = 0.01
