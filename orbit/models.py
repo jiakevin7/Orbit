@@ -2,6 +2,9 @@ import re
 from dataclasses import dataclass, field
 from .bloom import BloomFilter
 
+
+# These dataclasses are the artifact schema. Benchmark JSON/CSV output is built
+# directly from them, so field names are part of the reproducibility surface.
 @dataclass(frozen=True)
 class Request:
     request_id: str
@@ -10,9 +13,9 @@ class Request:
     prefix_tokens: tuple[int, ...]
     continuation_tokens: int = 32
     prompt_prefix_text: str | None = None
-    prefix_token_source: str = 'synthetic_lexical'
+    prefix_token_source: str = "synthetic_lexical"
     arrival_scale_applied: float = 1.0
-    traffic_class: str = 'synthetic'
+    traffic_class: str = "synthetic"
     session_id: str | None = None
     source_id: str | None = None
 
@@ -24,11 +27,12 @@ class Request:
     def prompt_text(self):
         if self.prompt_prefix_text is not None:
             normalized = self.prompt_prefix_text.rstrip()
-            if re.search('assistant:\\s*$', normalized, re.IGNORECASE):
+            if re.search("assistant:\\s*$", normalized, re.IGNORECASE):
                 return normalized
-            return f'{normalized}\nAssistant:'
-        token_text = ' '.join((f'tok_{token}' for token in self.prefix_tokens))
-        return f'You are participating in a routing benchmark.\nTreat the following prefix as reusable context.\n{token_text}\nAssistant:'
+            return f"{normalized}\nAssistant:"
+        token_text = " ".join((f"tok_{token}" for token in self.prefix_tokens))
+        return f"You are participating in a routing benchmark.\nTreat the following prefix as reusable context.\n{token_text}\nAssistant:"
+
 
 @dataclass(frozen=True)
 class ClusterSummary:
@@ -40,6 +44,7 @@ class ClusterSummary:
     filters: dict[int, BloomFilter]
     byte_size: int
     hot_prefix_hashes: dict[int, tuple[int, ...]] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class ClusterExecution:
@@ -53,6 +58,7 @@ class ClusterExecution:
     time_to_first_token: float
     cache_ready_at: float
 
+
 @dataclass(frozen=True)
 class RouteDecision:
     policy: str
@@ -61,6 +67,7 @@ class RouteDecision:
     predicted_latency: float
     used_fallback: bool = False
     details: dict[str, float] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class ExecutionRecord:
@@ -92,7 +99,7 @@ class ExecutionRecord:
     failover_delay: float
     attempt_count: int
     service_time: float
-    traffic_class: str = 'synthetic'
+    traffic_class: str = "synthetic"
     session_id: str | None = None
     source_id: str | None = None
     predicted_ttft: float = 0.0
@@ -100,6 +107,7 @@ class ExecutionRecord:
     raw_estimated_reusable_tokens: int = 0
     summary_matched_levels: int = 0
     hotset_matched_levels: int = 0
+
 
 @dataclass(frozen=True)
 class SimulationMetrics:

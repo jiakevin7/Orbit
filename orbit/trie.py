@@ -1,14 +1,16 @@
 from dataclasses import dataclass, field
 
+
 @dataclass
 class TrieNode:
     count: int = 0
     terminal_count: int = 0
-    children: dict[int, 'TrieNode'] = field(default_factory=dict)
+    children: dict[int, "TrieNode"] = field(default_factory=dict)
+
 
 class PrefixTrie:
-
     def __init__(self):
+        # Counts let removal prune shared paths safely when cache entries evict.
         self.root = TrieNode()
         self.size = 0
 
@@ -27,11 +29,11 @@ class PrefixTrie:
         for token in tokens:
             child = node.children.get(token)
             if child is None:
-                raise KeyError('prefix is not present in the trie')
+                raise KeyError("prefix is not present in the trie")
             node = child
             nodes.append(node)
         if node.terminal_count == 0:
-            raise KeyError('prefix is not present in the trie')
+            raise KeyError("prefix is not present in the trie")
         node.terminal_count -= 1
         for visited in nodes:
             visited.count -= 1

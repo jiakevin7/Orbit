@@ -1,16 +1,24 @@
 from pathlib import Path
 
 
+# Defaults mirror the final benchmark manifest so `python -m orbit` reproduces
+# the current research run without a separate config file.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_BACKEND = "llama_cpp"
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf"
 
-DEFAULT_SHAREGPT_PATH = REPO_ROOT / "results" / "external-datasets-20260418" / "sharegpt_x_chat.json"
-DEFAULT_RAG_PATH = REPO_ROOT / "results" / "external-datasets-20260418" / "ragbench_hotpotqa.json"
-DEFAULT_AGENT_PATH = REPO_ROOT / "results" / "external-datasets-20260418" / "toolbench_g123_query.json"
+DEFAULT_SHAREGPT_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "sharegpt_x_chat.json"
+)
+DEFAULT_RAG_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "ragbench_hotpotqa.json"
+)
+DEFAULT_AGENT_PATH = (
+    REPO_ROOT / "results" / "external-datasets-20260418" / "toolbench_g123_query.json"
+)
 
-DEFAULT_POLICIES = ("summary", "load_only", "random", "round_robin")
+DEFAULT_POLICIES = ("orbit", "least_loaded", "random", "round_robin")
 DEFAULT_SEEDS = (7, 11, 17, 23, 29)
 
 DEFAULT_TOTAL_REQUESTS = 144
@@ -32,7 +40,7 @@ DEFAULT_CACHE_CAPACITY = 256
 DEFAULT_CACHE_TOKEN_CAPACITY = 4096
 
 DEFAULT_CALIBRATE_ROUTER = True
-DEFAULT_CALIBRATION_POLICY = "summary"
+DEFAULT_CALIBRATION_POLICY = "orbit"
 DEFAULT_VALIDATION_P95_REGRESSION_TOLERANCE = 0.05
 
 DEFAULT_LLAMA_EXECUTABLE = "llama-server"

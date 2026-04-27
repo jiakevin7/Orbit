@@ -19,7 +19,7 @@ The repository is centered on the final evaluation setup, so the default benchma
 - topology: `4` routers, `6` clusters, sparse overlap, `3` reachable clusters per router
 - requests per seed: `24` warmup, `24` validation, `96` measured
 - seeds: `7 11 17 23 29`
-- policies: `summary`, `load_only`, `random`, `round_robin`
+- policies: `orbit`, `least_loaded`, `random`, `round_robin`
 - cache token capacity: `4096`
 - live arrival scale: `0.01`
 - calibration: global warmup fit with held-out p95 guardrail
@@ -74,6 +74,11 @@ python3 scripts/visualize_run.py results/orbit-default
 
 Curated figures include:
 
+- `orbit_01_ttft_p50.png`
+- `orbit_02_reuse_fraction.png`
+- `orbit_03_reusable_prefix_by_traffic.png`
+- `orbit_04_latency_vs_reuse.png`
+- `orbit_combined.png`
 - `ttft_cdf.png`
 - `latency_cdf.png`
 - `ttft_by_policy.png`
@@ -92,8 +97,8 @@ results/mixed-external-renamed-baselines-large-v7-20260420
 
 Aggregate results:
 
-- Orbit (`summary`): `ttft_p50_mean=0.561`, `latency_p50_mean=2.509`, `mean_reusable_prefix_mean=100.08`
-- Least Loaded (`load_only`): `3.175`, `5.011`, `77.62`
+- Orbit: `ttft_p50_mean=0.561`, `latency_p50_mean=2.509`, `mean_reusable_prefix_mean=100.08`
+- Least Loaded: `3.175`, `5.011`, `77.62`
 - Random: `3.349`, `5.618`, `75.22`
 - Round Robin: `8.832`, `11.868`, `60.57`
 

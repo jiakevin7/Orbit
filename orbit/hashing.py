@@ -1,15 +1,19 @@
 import hashlib
 from collections import Counter, defaultdict
 
+
 def hash_prefix(tokens, depth):
+    # Hash only the leading prefix so identical prompt prefixes map to identical
+    # summary entries across clusters and routers.
     if depth < 0:
-        raise ValueError('depth must be non-negative')
+        raise ValueError("depth must be non-negative")
     if depth > len(tokens):
-        raise ValueError('depth cannot exceed the prefix length')
+        raise ValueError("depth cannot exceed the prefix length")
     hasher = hashlib.blake2b(digest_size=8)
     for token in tokens[:depth]:
-        hasher.update(int(token).to_bytes(8, byteorder='little', signed=False))
-    return int.from_bytes(hasher.digest(), byteorder='big', signed=False)
+        hasher.update(int(token).to_bytes(8, byteorder="little", signed=False))
+    return int.from_bytes(hasher.digest(), byteorder="big", signed=False)
+
 
 def prefix_hashes(tokens, depths):
     result: dict[int, int] = {}
@@ -18,7 +22,10 @@ def prefix_hashes(tokens, depths):
             result[depth] = hash_prefix(tokens, depth)
     return result
 
+
 def hot_prefix_hashes(token_sequences, depths, per_depth_limit):
+    # Hotsets complement Bloom filters by making frequent short-prefix matches
+    # exact instead of probabilistic.
     if per_depth_limit <= 0:
         return {}
     counters: dict[int, Counter[int]] = defaultdict(Counter)
@@ -32,6 +39,8 @@ def hot_prefix_hashes(token_sequences, depths, per_depth_limit):
         counts = counters.get(depth)
         if not counts:
             continue
-        hottest = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:per_depth_limit]
+        hottest = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[
+            :per_depth_limit
+        ]
         hotsets[depth] = tuple((hash_value for hash_value, _ in hottest))
     return hotsets

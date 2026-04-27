@@ -15,6 +15,8 @@ timestamp="$(date +%Y%m%d-%H%M%S)"
 output_dir="results/orbit-live-${timestamp}"
 args=("$@")
 
+# Preserve the user's output directory if they override the default benchmark
+# destination, then pass all arguments through to the Python runner.
 for ((index = 0; index < ${#args[@]}; index++)); do
   case "${args[index]}" in
     --output-dir)
