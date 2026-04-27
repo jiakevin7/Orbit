@@ -91,7 +91,7 @@ def _build_live_requests():
     os.environ.get("ORBIT_RUN_LIVE_TESTS") == "1", _live_test_skip_reason()
 )
 class LiveLlamaCppIntegrationTests(unittest.TestCase):
-    def test_benchmark_runner_exercises_validation_and_fault_injection_live(self):
+    def test_benchmark_runner_exercises_fault_injection_live(self):
         prerequisite_error = _live_test_prerequisite_error()
         if prerequisite_error is not None:
             self.fail(prerequisite_error)
@@ -114,15 +114,10 @@ class LiveLlamaCppIntegrationTests(unittest.TestCase):
                     str(model_path),
                     "--policies",
                     "least_loaded",
-                    "--calibration-policy",
-                    "least_loaded",
                     "--requests",
                     "10",
                     "--warmup-requests",
                     "8",
-                    "--validation-requests",
-                    "1",
-                    "--calibrate-router",
                     "--routers",
                     "1",
                     "--clusters",
@@ -161,9 +156,6 @@ class LiveLlamaCppIntegrationTests(unittest.TestCase):
             output_dir = Path(tmpdir)
             expected_paths = [
                 output_dir / "manifest.json",
-                output_dir / "calibration.json",
-                output_dir / "selection.json",
-                output_dir / "validation_workload.json",
                 output_dir / "summary.json",
                 output_dir / "summary_by_traffic.csv",
                 output_dir / "summary_by_source.csv",
@@ -173,18 +165,7 @@ class LiveLlamaCppIntegrationTests(unittest.TestCase):
                 self.assertTrue(path.exists(), f"missing artifact: {path}")
             manifest = json.loads((output_dir / "manifest.json").read_text())
             self.assertEqual(manifest["backend"], "llama_cpp")
-            self.assertEqual(manifest["validation_requests"], 1)
             self.assertEqual(manifest["faults"]["failed_clusters"], ["cluster-0"])
-            calibration = json.loads((output_dir / "calibration.json").read_text())
-            self.assertEqual(calibration["record_count"], 8)
-            selection = json.loads((output_dir / "selection.json").read_text())
-            self.assertIn(selection["selected_config"], {"base", "calibrated"})
-            self.assertEqual(
-                selection["selection_metric"],
-                "validation_prediction_mae_with_p95_guardrail",
-            )
-            self.assertIn("base_validation_error", selection)
-            self.assertIn("calibrated_validation_error", selection)
             workload = json.loads((output_dir / "workload.json").read_text())
             self.assertEqual(len(workload), 10)
             self.assertTrue(
@@ -193,9 +174,9 @@ class LiveLlamaCppIntegrationTests(unittest.TestCase):
             summary = json.loads((output_dir / "summary.json").read_text())
             self.assertGreaterEqual(summary["least_loaded"]["failover_count"], 1)
             records = json.loads((output_dir / "least_loaded_records.json").read_text())
-            self.assertEqual(len(records), 1)
-            self.assertTrue(records[0]["had_failover"])
-            self.assertEqual(records[0]["attempt_count"], 2)
+            self.assertEqual(len(records), 2)
+            self.assertTrue(any((record["had_failover"] for record in records)))
+            self.assertTrue(any((record["attempt_count"] == 2 for record in records)))
 
 
 if __name__ == "__main__":

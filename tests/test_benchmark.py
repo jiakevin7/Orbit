@@ -7,17 +7,14 @@ from orbit.benchmark import (
     flatten_metrics_row,
     resolve_prompt_prefix_token_cap,
     resolve_reachable_clusters_per_router,
-    validation_candidate_accepted,
-    validation_metrics_summary,
     resolve_cache_token_capacity,
     split_workload,
 )
-from orbit.models import ExecutionRecord
 from orbit.models import Request
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_split_workload_separates_warmup_validation_and_test_requests(self):
+    def test_split_workload_separates_warmup_and_test_requests(self):
         requests = [
             Request(
                 request_id=f"req-{index}",
@@ -27,11 +24,11 @@ class BenchmarkTests(unittest.TestCase):
             )
             for index in range(5)
         ]
-        warmup, validation, measured = split_workload(requests, 2, 1)
+        warmup, measured = split_workload(requests, 2)
         self.assertEqual([request.request_id for request in warmup], ["req-0", "req-1"])
-        self.assertEqual([request.request_id for request in validation], ["req-2"])
         self.assertEqual(
-            [request.request_id for request in measured], ["req-3", "req-4"]
+            [request.request_id for request in measured],
+            ["req-2", "req-3", "req-4"],
         )
 
     def test_flatten_and_aggregate_metrics_rows(self):
@@ -213,141 +210,6 @@ class BenchmarkTests(unittest.TestCase):
         second = allocate_llama_cpp_ports(config, 1)
         self.assertEqual(first.llama_cpp.port_base, 18000)
         self.assertEqual(second.llama_cpp.port_base, 18016)
-
-    def test_validation_guardrail_rejects_p95_regression(self):
-        base_records = [
-            ExecutionRecord(
-                request_id="base-0",
-                policy="orbit",
-                router_id="router-0",
-                cluster_id="cluster-0",
-                arrival_time=0.0,
-                started_at=0.0,
-                finished_at=1.0,
-                predicted_latency=1.0,
-                actual_latency=1.0,
-                actual_ttft=0.5,
-                estimated_reusable_tokens=0,
-                actual_reusable_tokens=0,
-                estimated_remaining_prefill_tokens=10,
-                input_length=10,
-                continuation_tokens=4,
-                reuse_fraction=0.0,
-                network_cost=0.0,
-                queue_delay=0.0,
-                queue_depth_before=0,
-                route_queue_depth=0,
-                metadata_age=0.0,
-                uncertainty_gap=0,
-                missing_summary=False,
-                initial_cluster_id="cluster-0",
-                had_failover=False,
-                failover_delay=0.0,
-                attempt_count=1,
-                service_time=1.0,
-            ),
-            ExecutionRecord(
-                request_id="base-1",
-                policy="orbit",
-                router_id="router-0",
-                cluster_id="cluster-0",
-                arrival_time=1.0,
-                started_at=1.0,
-                finished_at=2.0,
-                predicted_latency=1.1,
-                actual_latency=1.1,
-                actual_ttft=0.55,
-                estimated_reusable_tokens=0,
-                actual_reusable_tokens=0,
-                estimated_remaining_prefill_tokens=10,
-                input_length=10,
-                continuation_tokens=4,
-                reuse_fraction=0.0,
-                network_cost=0.0,
-                queue_delay=0.0,
-                queue_depth_before=0,
-                route_queue_depth=0,
-                metadata_age=0.0,
-                uncertainty_gap=0,
-                missing_summary=False,
-                initial_cluster_id="cluster-0",
-                had_failover=False,
-                failover_delay=0.0,
-                attempt_count=1,
-                service_time=1.1,
-            ),
-        ]
-        candidate_records = [
-            ExecutionRecord(
-                request_id="cand-0",
-                policy="orbit",
-                router_id="router-0",
-                cluster_id="cluster-0",
-                arrival_time=0.0,
-                started_at=0.0,
-                finished_at=1.3,
-                predicted_latency=1.01,
-                actual_latency=1.3,
-                actual_ttft=0.8,
-                estimated_reusable_tokens=0,
-                actual_reusable_tokens=0,
-                estimated_remaining_prefill_tokens=10,
-                input_length=10,
-                continuation_tokens=4,
-                reuse_fraction=0.0,
-                network_cost=0.0,
-                queue_delay=0.0,
-                queue_depth_before=0,
-                route_queue_depth=0,
-                metadata_age=0.0,
-                uncertainty_gap=0,
-                missing_summary=False,
-                initial_cluster_id="cluster-0",
-                had_failover=False,
-                failover_delay=0.0,
-                attempt_count=1,
-                service_time=1.3,
-            ),
-            ExecutionRecord(
-                request_id="cand-1",
-                policy="orbit",
-                router_id="router-0",
-                cluster_id="cluster-0",
-                arrival_time=1.0,
-                started_at=1.0,
-                finished_at=2.4,
-                predicted_latency=1.09,
-                actual_latency=1.4,
-                actual_ttft=0.82,
-                estimated_reusable_tokens=0,
-                actual_reusable_tokens=0,
-                estimated_remaining_prefill_tokens=10,
-                input_length=10,
-                continuation_tokens=4,
-                reuse_fraction=0.0,
-                network_cost=0.0,
-                queue_delay=0.0,
-                queue_depth_before=0,
-                route_queue_depth=0,
-                metadata_age=0.0,
-                uncertainty_gap=0,
-                missing_summary=False,
-                initial_cluster_id="cluster-0",
-                had_failover=False,
-                failover_delay=0.0,
-                attempt_count=1,
-                service_time=1.4,
-            ),
-        ]
-        accepted, reasons = validation_candidate_accepted(
-            {"mae": 0.1, "rmse": 0.1},
-            validation_metrics_summary(base_records),
-            {"mae": 0.01, "rmse": 0.01},
-            validation_metrics_summary(candidate_records),
-            p95_regression_tolerance=0.05,
-        )
-        self.assertFalse(accepted)
-        self.assertIn("latency_p95_regressed", reasons)
 
 
 if __name__ == "__main__":

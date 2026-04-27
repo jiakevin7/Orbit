@@ -4,15 +4,12 @@ import statistics
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
-from .calibration import fit_router_config
 from .cluster import ClusterConfig
 from .defaults import (
     DEFAULT_AGENT_PATH,
     DEFAULT_BACKEND,
     DEFAULT_CACHE_CAPACITY,
     DEFAULT_CACHE_TOKEN_CAPACITY,
-    DEFAULT_CALIBRATE_ROUTER,
-    DEFAULT_CALIBRATION_POLICY,
     DEFAULT_CLUSTER_COUNT,
     DEFAULT_LLAMA_CTX_SIZE,
     DEFAULT_LLAMA_EXECUTABLE,
@@ -35,13 +32,10 @@ from .defaults import (
     DEFAULT_TRAFFIC_MIX_BURSTY,
     DEFAULT_TRAFFIC_MIX_CHAT,
     DEFAULT_TRAFFIC_MIX_RAG,
-    DEFAULT_VALIDATION_P95_REGRESSION_TOLERANCE,
-    DEFAULT_VALIDATION_REQUESTS,
     DEFAULT_WARMUP_REQUESTS,
     DEFAULT_WORKLOAD_KIND,
 )
 from .llamacpp import LlamaCppClusterConfig
-from .policies import POLICIES
 from .reporting import (
     execution_records_as_dicts,
     metrics_as_dict,
@@ -183,30 +177,6 @@ def build_parser():
         help="number of initial requests to use for warm-up and exclude from reported metrics",
     )
     parser.add_argument(
-        "--validation-requests",
-        type=int,
-        default=DEFAULT_VALIDATION_REQUESTS,
-        help="number of held-out requests used to select between base and calibrated router configs before final test evaluation",
-    )
-    parser.add_argument(
-        "--calibrate-router",
-        action="store_true",
-        default=DEFAULT_CALIBRATE_ROUTER,
-        help="fit router latency coefficients from the warm-up requests before evaluating policies",
-    )
-    parser.add_argument(
-        "--no-calibrate-router",
-        action="store_false",
-        dest="calibrate_router",
-        help="disable the default warm-up calibration pass",
-    )
-    parser.add_argument(
-        "--calibration-policy",
-        choices=tuple(POLICIES),
-        default=DEFAULT_CALIBRATION_POLICY,
-        help="policy used to collect warm-up traces for router calibration",
-    )
-    parser.add_argument(
         "--routers", type=int, default=DEFAULT_ROUTER_COUNT, help="number of routers"
     )
     parser.add_argument(
@@ -330,12 +300,6 @@ def build_parser():
         help="additional delay before rerouting after an injected cluster failure",
     )
     parser.add_argument(
-        "--validation-p95-regression-tolerance",
-        type=float,
-        default=DEFAULT_VALIDATION_P95_REGRESSION_TOLERANCE,
-        help="maximum relative p95 TTFT/latency regression allowed during validation canary selection",
-    )
-    parser.add_argument(
         "--llama-extra-arg",
         action="append",
         default=[],
@@ -363,16 +327,8 @@ def main(argv=None):
         parser.error("--model is required when --backend llama_cpp is used")
     if args.warmup_requests < 0:
         parser.error("--warmup-requests must be non-negative")
-    if args.validation_requests < 0:
-        parser.error("--validation-requests must be non-negative")
-    if args.warmup_requests + args.validation_requests >= args.requests:
-        parser.error(
-            "--warmup-requests plus --validation-requests must be smaller than --requests"
-        )
-    if args.calibrate_router and args.warmup_requests <= 0:
-        parser.error(
-            "--calibrate-router requires --warmup-requests to be greater than zero"
-        )
+    if args.warmup_requests >= args.requests:
+        parser.error("--warmup-requests must be smaller than --requests")
     if args.live_arrival_scale is not None and args.live_arrival_scale <= 0:
         parser.error("--live-arrival-scale must be positive")
     if args.continuation_token_cap is not None and args.continuation_token_cap <= 0:
@@ -382,8 +338,6 @@ def main(argv=None):
         and args.reachable_clusters_per_router <= 0
     ):
         parser.error("--reachable-clusters-per-router must be positive")
-    if args.validation_p95_regression_tolerance < 0:
-        parser.error("--validation-p95-regression-tolerance must be non-negative")
     for probability in (args.summary_drop_probability, args.gossip_drop_probability):
         if not 0.0 <= probability <= 1.0:
             parser.error("drop probabilities must be between 0 and 1")
@@ -409,14 +363,11 @@ def main(argv=None):
         "policies": list(policies),
         "request_count": args.requests,
         "warmup_requests": args.warmup_requests,
-        "validation_requests": args.validation_requests,
         "router_count": args.routers,
         "cluster_count": args.clusters,
         "topology_mode": args.topology_mode,
         "reachable_clusters_per_router": resolve_reachable_clusters_per_router(args),
         "continuation_token_cap": args.continuation_token_cap,
-        "calibrate_router": args.calibrate_router,
-        "calibration_policy": args.calibration_policy,
         "seeds": list(seeds),
         "record_format": args.record_format,
         "workload_kind": args.workload_kind,
@@ -437,8 +388,6 @@ def main(argv=None):
         },
         "control_plane_mode": args.control_plane_mode,
         "control_plane_start_method": args.control_plane_start_method,
-        "calibration_scope": "global" if args.calibrate_router else "disabled",
-        "validation_p95_regression_tolerance": args.validation_p95_regression_tolerance,
         "prefix_token_source": "llama_cpp"
         if args.backend == "llama_cpp"
         else "synthetic_lexical",
@@ -454,8 +403,8 @@ def main(argv=None):
     source_run_rows: list[dict[str, object]] = []
     seed_runs: list[dict[str, object]] = []
 
-    # Materialize all workloads before calibration or evaluation. For llama.cpp,
-    # this also performs backend tokenization so every policy sees real token ids.
+    # Materialize all workloads before evaluation. For llama.cpp, this also
+    # performs backend tokenization so every policy sees real token ids.
     for seed in seeds:
         config = build_simulation_config(args, seed=seed)
         simulation_allocation_index = 0
@@ -476,9 +425,7 @@ def main(argv=None):
             finally:
                 prepare_simulation.close()
 
-        warmup_requests, validation_requests, test_requests = split_workload(
-            requests, args.warmup_requests, args.validation_requests
-        )
+        warmup_requests, test_requests = split_workload(requests, args.warmup_requests)
         run_dir = output_dir if len(seeds) == 1 else output_dir / f"seed-{seed}"
 
         # Persist every split so the exact benchmark input is auditable.
@@ -486,11 +433,6 @@ def main(argv=None):
         if warmup_requests:
             write_json(
                 run_dir / "warmup_workload.json", requests_as_dicts(warmup_requests)
-            )
-        if validation_requests:
-            write_json(
-                run_dir / "validation_workload.json",
-                requests_as_dicts(validation_requests),
             )
         write_json(run_dir / "measured_workload.json", requests_as_dicts(test_requests))
         write_json(run_dir / "test_workload.json", requests_as_dicts(test_requests))
@@ -501,121 +443,17 @@ def main(argv=None):
                 "allocate_config": allocate_config,
                 "run_dir": run_dir,
                 "warmup_requests": warmup_requests,
-                "validation_requests": validation_requests,
                 "test_requests": test_requests,
             }
         )
 
-    # Optional auto-tuning: warm-up traffic can fit a global router model, but
-    # the final config is still subject to the validation guardrail below.
-    calibrated_router_config = (
-        seed_runs[0]["config"].router_config if seed_runs else RouterConfig()
-    )
-    calibration_payload: dict[str, object] | None = None
-    if args.calibrate_router:
-        calibration_records: list = []
-        calibration_records_by_seed: dict[str, int] = {}
-        for seed_run in seed_runs:
-            warmup_requests = seed_run["warmup_requests"]
-            if not warmup_requests:
-                continue
-            calibration_simulation = Simulation(
-                seed_run["allocate_config"](seed_run["config"])
-            )
-            try:
-                records, _ = calibration_simulation.run(
-                    policy_name=args.calibration_policy,
-                    requests=warmup_requests,
-                    close_on_finish=True,
-                )
-            finally:
-                calibration_simulation.close()
-            calibration_records.extend(records)
-            calibration_records_by_seed[str(seed_run["seed"])] = len(records)
-        calibrated_router_config, calibration = fit_router_config(
-            calibration_records,
-            seed_runs[0]["config"].router_config,
-            source_policy=args.calibration_policy,
-        )
-        calibration_payload = asdict(calibration)
-        calibration_payload["evaluation_seeds"] = list(seeds)
-        calibration_payload["records_by_seed"] = calibration_records_by_seed
-        write_json(output_dir / "calibration.json", calibration_payload)
-
-    # Validate the calibrated model on held-out traffic. This prevents a fitted
-    # model with lower prediction error from being selected if tail latency gets
-    # worse in replay.
-    selected_router_config = calibrated_router_config
-    selection_payload: dict[str, object] | None = None
-    if any((seed_run["validation_requests"] for seed_run in seed_runs)):
-        base_validation_records: list = []
-        calibrated_validation_records: list = []
-        validation_records_by_seed: dict[str, dict[str, int]] = {}
-        for seed_run in seed_runs:
-            validation_requests = seed_run["validation_requests"]
-            if not validation_requests:
-                continue
-            base_records = replay_policy(
-                seed_run["config"],
-                args.calibration_policy,
-                seed_run["warmup_requests"],
-                validation_requests,
-                config_allocator=seed_run["allocate_config"],
-            )
-            calibrated_records = replay_policy(
-                replace(seed_run["config"], router_config=calibrated_router_config),
-                args.calibration_policy,
-                seed_run["warmup_requests"],
-                validation_requests,
-                config_allocator=seed_run["allocate_config"],
-            )
-            base_validation_records.extend(base_records)
-            calibrated_validation_records.extend(calibrated_records)
-            validation_records_by_seed[str(seed_run["seed"])] = {
-                "base": len(base_records),
-                "calibrated": len(calibrated_records),
-            }
-        base_validation_error = prediction_error_summary(base_validation_records)
-        base_validation_metrics = validation_metrics_summary(base_validation_records)
-        calibrated_validation_error = prediction_error_summary(
-            calibrated_validation_records
-        )
-        calibrated_validation_metrics = validation_metrics_summary(
-            calibrated_validation_records
-        )
-        accepted, reasons = validation_candidate_accepted(
-            base_validation_error,
-            base_validation_metrics,
-            calibrated_validation_error,
-            calibrated_validation_metrics,
-            args.validation_p95_regression_tolerance,
-        )
-        selection_payload = {
-            "selected_config": "calibrated" if accepted else "base",
-            "selection_metric": "validation_prediction_mae_with_p95_guardrail",
-            "p95_regression_tolerance": args.validation_p95_regression_tolerance,
-            "evaluation_seeds": list(seeds),
-            "records_by_seed": validation_records_by_seed,
-            "base_validation_error": base_validation_error,
-            "base_validation_metrics": base_validation_metrics,
-            "calibrated_validation_error": calibrated_validation_error,
-            "calibrated_validation_metrics": calibrated_validation_metrics,
-            "calibrated_rejection_reasons": reasons,
-        }
-        if not accepted:
-            selected_router_config = seed_runs[0]["config"].router_config
-        write_json(output_dir / "selection.json", selection_payload)
-
     # Final evaluation: replay warm-up to rebuild cache state, then measure only
-    # the test split for every policy under the selected router configuration.
+    # the test split for every policy under the fixed router configuration.
     for seed_run in seed_runs:
         seed = seed_run["seed"]
-        selected_config = replace(
-            seed_run["config"], router_config=selected_router_config
-        )
         metrics_by_policy = {}
         for policy_name in policies:
-            simulation = Simulation(seed_run["allocate_config"](selected_config))
+            simulation = Simulation(seed_run["allocate_config"](seed_run["config"]))
             if seed_run["warmup_requests"]:
                 simulation.run(
                     policy_name=policy_name,
@@ -673,7 +511,7 @@ def main(argv=None):
             [row for row in source_run_rows if row["seed"] == seed],
         )
         metrics_by_seed[seed] = {
-            "simulation_config": asdict(selected_config),
+            "simulation_config": asdict(seed_run["config"]),
             "metrics": {
                 policy_name: metrics_as_dict(metrics)
                 for policy_name, metrics in metrics_by_policy.items()
@@ -855,14 +693,11 @@ def resolve_output_dir(output_dir):
     return (Path.cwd() / "results" / f"benchmark-{timestamp}").resolve()
 
 
-def split_workload(requests, warmup_requests, validation_requests=0):
+def split_workload(requests, warmup_requests):
     requests = list(requests)
     warmup = requests[:warmup_requests]
-    validation_start = warmup_requests
-    validation_end = validation_start + validation_requests
-    validation = requests[validation_start:validation_end]
-    test = requests[validation_end:]
-    return (warmup, validation, test)
+    test = requests[warmup_requests:]
+    return (warmup, test)
 
 
 def aggregate_summary_rows(rows, group_keys=("policy",)):
@@ -918,174 +753,6 @@ def bootstrap_mean_confidence_interval(
     lower_index = int((1.0 - confidence) / 2.0 * (bootstrap_samples - 1))
     upper_index = int((1.0 - (1.0 - confidence) / 2.0) * (bootstrap_samples - 1))
     return (means[lower_index], means[upper_index])
-
-
-def replay_policy(
-    config, policy_name, warmup_requests, eval_requests, config_allocator=None
-):
-    simulation = Simulation(
-        config_allocator(config) if config_allocator is not None else config
-    )
-    try:
-        if warmup_requests:
-            simulation.run(
-                policy_name=policy_name, requests=warmup_requests, close_on_finish=False
-            )
-        records, _ = simulation.run(
-            policy_name=policy_name, requests=eval_requests, close_on_finish=True
-        )
-        return records
-    finally:
-        simulation.close()
-
-
-def select_config_by_validation(
-    base_config,
-    calibrated_config,
-    calibration_policy,
-    warmup_requests,
-    validation_requests,
-    p95_regression_tolerance,
-    config_allocator=None,
-):
-    base_records = replay_policy(
-        base_config,
-        calibration_policy,
-        warmup_requests,
-        validation_requests,
-        config_allocator=config_allocator,
-    )
-    base_validation_error = prediction_error_summary(base_records)
-    base_validation_metrics = validation_metrics_summary(base_records)
-    payload: dict[str, object] = {
-        "selected_config": "base",
-        "selection_metric": "validation_prediction_mae_with_p95_guardrail",
-        "p95_regression_tolerance": p95_regression_tolerance,
-        "base_validation_error": base_validation_error,
-        "base_validation_metrics": base_validation_metrics,
-    }
-    calibrated_records = replay_policy(
-        calibrated_config,
-        calibration_policy,
-        warmup_requests,
-        validation_requests,
-        config_allocator=config_allocator,
-    )
-    calibrated_validation_error = prediction_error_summary(calibrated_records)
-    calibrated_validation_metrics = validation_metrics_summary(calibrated_records)
-    accepted, reasons = validation_candidate_accepted(
-        base_validation_error,
-        base_validation_metrics,
-        calibrated_validation_error,
-        calibrated_validation_metrics,
-        p95_regression_tolerance,
-    )
-    payload["calibrated_validation_error"] = calibrated_validation_error
-    payload["calibrated_validation_metrics"] = calibrated_validation_metrics
-    payload["calibrated_rejection_reasons"] = reasons
-    if accepted:
-        payload["selected_config"] = "calibrated"
-        return (calibrated_config, payload)
-    return (base_config, payload)
-
-
-def prediction_error_summary(records):
-    if not records:
-        return {"mae": 0.0, "rmse": 0.0}
-    errors = [record.predicted_latency - record.actual_latency for record in records]
-    mae = statistics.fmean((abs(error) for error in errors))
-    rmse = statistics.fmean((error * error for error in errors)) ** 0.5
-    return {"mae": mae, "rmse": rmse}
-
-
-def validation_metrics_summary(records):
-    if not records:
-        return {
-            "ttft_p50": 0.0,
-            "ttft_p95": 0.0,
-            "latency_p50": 0.0,
-            "latency_p95": 0.0,
-            "per_cluster": {},
-        }
-    ttfts = sorted((record.actual_ttft for record in records))
-    latencies = sorted((record.actual_latency for record in records))
-    per_cluster: dict[str, dict[str, float]] = {}
-    for cluster_id in sorted({record.cluster_id for record in records}):
-        cluster_records = [
-            record for record in records if record.cluster_id == cluster_id
-        ]
-        per_cluster[cluster_id] = {
-            "request_count": float(len(cluster_records)),
-            "ttft_p95": _percentile(
-                [record.actual_ttft for record in cluster_records], 0.95
-            ),
-            "latency_p95": _percentile(
-                [record.actual_latency for record in cluster_records], 0.95
-            ),
-        }
-    return {
-        "ttft_p50": _percentile(ttfts, 0.5),
-        "ttft_p95": _percentile(ttfts, 0.95),
-        "latency_p50": _percentile(latencies, 0.5),
-        "latency_p95": _percentile(latencies, 0.95),
-        "per_cluster": per_cluster,
-    }
-
-
-def validation_candidate_accepted(
-    base_error,
-    base_metrics,
-    candidate_error,
-    candidate_metrics,
-    p95_regression_tolerance,
-):
-    reasons: list[str] = []
-    if candidate_error["mae"] >= base_error["mae"]:
-        reasons.append("prediction_mae_not_improved")
-    if _regressed(
-        float(base_metrics["latency_p95"]),
-        float(candidate_metrics["latency_p95"]),
-        p95_regression_tolerance,
-    ):
-        reasons.append("latency_p95_regressed")
-    if _regressed(
-        float(base_metrics["ttft_p95"]),
-        float(candidate_metrics["ttft_p95"]),
-        p95_regression_tolerance,
-    ):
-        reasons.append("ttft_p95_regressed")
-    base_clusters = base_metrics.get("per_cluster", {})
-    candidate_clusters = candidate_metrics.get("per_cluster", {})
-    if isinstance(base_clusters, dict) and isinstance(candidate_clusters, dict):
-        for cluster_id in sorted(set(base_clusters) & set(candidate_clusters)):
-            base_cluster_metrics = base_clusters[cluster_id]
-            candidate_cluster_metrics = candidate_clusters[cluster_id]
-            if _regressed(
-                float(base_cluster_metrics["latency_p95"]),
-                float(candidate_cluster_metrics["latency_p95"]),
-                p95_regression_tolerance,
-            ):
-                reasons.append(f"cluster_{cluster_id}_latency_p95_regressed")
-    return (len(reasons) == 0, reasons)
-
-
-def _regressed(base_value, candidate_value, tolerance):
-    if base_value <= 0.0:
-        return candidate_value > base_value
-    return candidate_value > base_value * (1.0 + tolerance)
-
-
-def _percentile(values, quantile):
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    position = quantile * (len(ordered) - 1)
-    lower_index = int(position)
-    upper_index = min(lower_index + 1, len(ordered) - 1)
-    weight = position - lower_index
-    return ordered[lower_index] * (1.0 - weight) + ordered[upper_index] * weight
 
 
 if __name__ == "__main__":

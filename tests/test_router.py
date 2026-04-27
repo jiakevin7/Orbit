@@ -31,7 +31,7 @@ class RouterTests(unittest.TestCase):
         router.receive_summary(summary, summary.created_at, source="cluster-a")
         reuse_estimate = router.estimate_reusable_prefix((1, 2, 3, 4, 9, 9), summary)
         self.assertEqual(reuse_estimate.raw_tokens, 5)
-        self.assertEqual(reuse_estimate.calibrated_tokens, 5)
+        self.assertEqual(reuse_estimate.estimated_tokens, 5)
         self.assertEqual(reuse_estimate.matched_levels, 2)
 
     def test_router_prefers_cluster_with_better_predicted_reuse(self):

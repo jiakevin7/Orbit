@@ -1,4 +1,3 @@
-from .calibration import RouterCalibration, fit_router_config
 from .cluster import Cluster, ClusterConfig
 from .llamacpp import LlamaCppClusterConfig
 from .router import Router, RouterConfig
@@ -9,13 +8,11 @@ __all__ = [
     "Cluster",
     "ClusterConfig",
     "LlamaCppClusterConfig",
-    "RouterCalibration",
     "Router",
     "RouterConfig",
     "Simulation",
     "SimulationConfig",
     "WorkloadConfig",
-    "fit_router_config",
     "generate_workload",
     "run_policies",
 ]

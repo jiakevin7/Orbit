@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from .hashing import prefix_hashes
 from .models import ClusterSummary, RouteDecision
 
-# Orbit uses one global calibrated cost model. Per-cluster differences enter only
+# Orbit uses one global fixed cost model. Per-cluster differences enter only
 # through router-to-cluster network cost and the summary state seen by the router.
 _COST_FIELDS = (
     "fixed_overhead",
@@ -74,7 +74,7 @@ class RouterView:
 
 @dataclass(frozen=True)
 class ReuseEstimate:
-    calibrated_tokens: int
+    estimated_tokens: int
     raw_tokens: int
     matched_levels: int
     hotset_matched_levels: int
@@ -93,8 +93,8 @@ def build_prediction_details(
     missing_summary=False,
     extra_uncertainty_penalty=0.0,
 ):
-    # Keep every cost component in the decision trace so plots and calibration
-    # can explain why a route was selected.
+    # Keep every cost component in the decision trace so plots can explain why a
+    # route was selected.
     coefficients = {
         field_name: float(getattr(config, field_name)) for field_name in _COST_FIELDS
     }
@@ -202,7 +202,7 @@ class Router:
             next_depth=next_depth,
             request_length=len(tokens),
         )
-        calibrated_estimate = self.calibrate_reuse(
+        adjusted_estimate = self.adjust_reuse_estimate(
             request_length=len(tokens),
             raw_estimated_reusable_tokens=raw_estimate,
             matched_levels=matched_levels,
@@ -214,14 +214,14 @@ class Router:
             depths=summary.depths,
         )
         return ReuseEstimate(
-            calibrated_tokens=calibrated_estimate,
+            estimated_tokens=adjusted_estimate,
             raw_tokens=raw_estimate,
             matched_levels=matched_levels,
             hotset_matched_levels=hotset_matched_levels,
             uncertainty_gap=uncertainty_gap,
         )
 
-    def calibrate_reuse(
+    def adjust_reuse_estimate(
         self,
         request_length,
         raw_estimated_reusable_tokens,
@@ -359,7 +359,7 @@ class Router:
             reuse_estimate = self.estimate_reusable_prefix(
                 request.prefix_tokens, summary
             )
-            estimated_reuse = reuse_estimate.calibrated_tokens
+            estimated_reuse = reuse_estimate.estimated_tokens
             raw_queue_depth = summary.queue_depth
             uncertainty_gap = reuse_estimate.uncertainty_gap
             extra_uncertainty_penalty = 0.0
