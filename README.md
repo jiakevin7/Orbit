@@ -62,7 +62,7 @@ The model file must exist at:
 models/qwen2.5-3b-instruct-q4_k_m.gguf
 ```
 
-`llama-server` must be available on `PATH`.
+`llama-server` must be available on `PATH`. Running these scripts took roughly 1 hour on an M4 MacBook with 24 GBs of RAM.
 
 ## Plot
 
