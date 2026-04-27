@@ -59,7 +59,7 @@ python3 scripts/benchmark_policies.py \
 
 ### External Datasets
 
-The default mixed workload expects these local dataset files:
+The default mixed workload expects three prepared dataset files under `results/external-datasets-20260418/`:
 
 ```text
 results/external-datasets-20260418/sharegpt_x_chat.json
@@ -73,7 +73,7 @@ These represent the three traffic classes used in the final evaluation:
 - `rag`: retrieval-augmented generation prompts
 - `agent`: tool-use / agentic prompts
 
-If those files are not present, either restore them into the paths above or pass replacement dataset paths to `scripts/benchmark_policies.py` with `--sharegpt-path`, `--rag-path`, and `--agent-path`.
+If those files are not included with your copy of the project, create that directory and place compatible JSON/JSONL datasets at those paths. Alternatively, pass your own paths to `scripts/benchmark_policies.py` with `--sharegpt-path`, `--rag-path`, and `--agent-path`.
 
 ## Default Benchmark Configuration
 
@@ -91,6 +91,18 @@ If those files are not present, either restore them into the paths above or pass
 - Live arrival scale: `0.01`
 
 Warmup requests are replayed before each measured policy run so caches and summaries are populated. There is no calibration or validation-selection phase in the current code path.
+
+## Runtime Expectations
+
+Runtime depends heavily on hardware, `llama.cpp` build options, and the selected GGUF model.
+
+- Environment setup and model download: usually `5-20` minutes, dominated by the roughly 2.1 GB model download.
+- Synthetic smoke test: usually under `1` minute.
+- Unit tests: usually under `1` minute.
+- Full default live benchmark: expect roughly `45-90` minutes on a high-end Apple Silicon laptop or workstation-class CPU. Slower laptops can take several hours.
+- Plot generation after benchmark completion: usually `1-3` minutes.
+
+If you only want to verify installation, run the synthetic smoke test first. Use the full live benchmark only after `llama-server --help` works and the model file exists.
 
 ## Running Benchmarks
 
@@ -251,15 +263,9 @@ The router only takes a prefix-aware route when the summary evidence is fresh an
 - `scripts/visualize_run.py`: refresh PNG plots for an existing run
 - `scripts/run_ci_checks.sh`: unit and optional live integration test runner
 
-## Reference Result
+## Expected Result Shape
 
-The latest completed live benchmark in this workspace is:
-
-```text
-results/mixed-external-renamed-baselines-large-v7-20260420
-```
-
-Headline aggregate metrics from that run:
+A successful full run should produce one top-level result directory with aggregate metrics and one `seed-*` subdirectory per seed. The exact latency values will vary by machine, `llama.cpp` build, model file, and background load. In the reference run used for the project report, the aggregate metrics had this shape:
 
 - Orbit: `ttft_p50_mean=0.561`, `latency_p50_mean=2.509`, `mean_reusable_prefix_mean=100.08`
 - Least-Loaded: `3.175`, `5.011`, `77.62`
